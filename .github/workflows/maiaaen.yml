@@ -1,0 +1,160 @@
+name: RDP Gaming Server Windows (My Summer Car Extra Impossible Mode Fixed Loop)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp-gaming:
+    runs-on: windows-2022
+    timeout-minutes: 4320  # 72 ore
+
+    steps:
+      - name: Extra Impossible Mode GPU Fake RTX 3060 + WARP Max (fix loop)
+        shell: pwsh
+        run: |
+          Write-Host "=== Extra Impossible Mode: GPU Fake RTX 3060 + WARP Max Ultra pentru My Summer Car ==="
+
+          # Force WARP software rendering
+          reg add "HKCU\Software\Microsoft\Direct3D" /v "ForceWarp" /t REG_DWORD /d 1 /f
+
+          # Fake GPU info
+          reg add "HKLM\Software\FakeGPU" /v "Name" /t REG_SZ /d "NVIDIA GeForce RTX 3060" /f
+          reg add "HKLM\Software\FakeGPU" /v "VRAM_MB" /t REG_DWORD /d 16384 /f
+          reg add "HKLM\Software\FakeGPU" /v "Bandwidth_MBps" /t REG_DWORD /d 500000 /f
+          reg add "HKLM\Software\FakeGPU" /v "DriverVersion" /t REG_SZ /d "546.33" /f
+          reg add "HKLM\Software\FakeGPU" /v "CUDA" /t REG_SZ /d "8.6" /f
+          reg add "HKLM\Software\FakeGPU" /v "RayTracing" /t REG_SZ /d "Supported" /f
+
+          # High Performance Power + Timer tweaks
+          powercfg /setactive SCHEME_MIN
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Kernel" /v "GlobalTimerResolutionRequests" /t REG_DWORD /d 1 /f
+
+          # CPU RealTime Priority
+          $proc = Get-Process -Id $PID
+          $proc.PriorityClass = "Realtime"
+
+          # Registry tweaks WARP extra ultra
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "ThreadCount" /t REG_DWORD /d 128 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "MaxConcurrency" /t REG_DWORD /d 64 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "UseHighPrecision" /t REG_DWORD /d 1 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "EnableCommandLists" /t REG_DWORD /d 1 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "EnableAdaptiveCommandLists" /t REG_DWORD /d 1 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "EnableMaxPerformanceMode" /t REG_DWORD /d 1 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "DisableDebugLayers" /t REG_DWORD /d 1 /f
+
+          # Opri complet serviciile inutile (ignoră erorile dacă nu există)
+          $stops = "DiagTrack","WSearch","SysMain","MapsBroker","PrintNotify","Spooler"
+          foreach ($s in $stops) {
+            if (Get-Service -Name $s -ErrorAction SilentlyContinue) {
+              try { Stop-Service -Name $s -Force -ErrorAction SilentlyContinue } catch {}
+            }
+          }
+
+          Write-Host "GPU Fake RTX 3060 activat + WARP Extra Impossible Mode (ultra fixes applied)"
+
+      - name: Activeaza Remote Desktop
+        shell: pwsh
+        run: |
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: RevealOrResetRunneradmin (afișează sau resetează runneradmin)
+        shell: pwsh
+        env:
+          runneradmin_PASS: ${{ secrets.RUNNERADMIN_PASS || '' }}
+        run: |
+          Add-Type -AssemblyName System.Security
+          function GenPass { -join ((33..126) | Get-Random -Count 16 | % {[char]$_}) }
+          $user = "runneradmin"
+          $existingUser = Get-LocalUser -Name $user -ErrorAction SilentlyContinue
+
+          if (-not $existingUser) {
+            Write-Host "User '$user' nu exista pe sistem. Nu vom modifica nimic."
+            exit 0
+          }
+
+          if ($env:runneradmin_PASS -and $env:runneradmin_PASS.Trim().Length -gt 0) {
+            Write-Host "Runneradmin parola gasita in mediu. Nu se reseteaza."
+            Write-Output "RUNNERADMIN_USER=$user" >> $env:GITHUB_ENV
+            Write-Output "RUNNERADMIN_PASS=$env:runneradmin_PASS" >> $env:GITHUB_ENV
+            exit 0
+          }
+
+          # Generare si setare parola noua
+          $newPass = GenPass
+          $secure = ConvertTo-SecureString $newPass -AsPlainText -Force
+          try {
+            Set-LocalUser -Name $user -Password $secure -ErrorAction Stop
+            Write-Host "Parola pentru '$user' a fost resetata si exportata in GITHUB_ENV."
+            Write-Output "RUNNERADMIN_USER=$user" >> $env:GITHUB_ENV
+            Write-Output "RUNNERADMIN_PASS=$newPass" >> $env:GITHUB_ENV
+          } catch {
+            Write-Host "Eroare la resetarea parolei pentru '$user': $_"
+            exit 1
+          }
+
+      - name: Instaleaza si configureaza Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-server-$env:GITHUB_RUN_ID
+
+      - name: Afiseaza toate datele de conectare (user + parola + IP)
+        shell: pwsh
+        run: |
+          # Citim din GITHUB_ENV (variabile exportate in pasi anteriori) sau din conturile locale daca exista
+          $runnerUser = $env:RUNNERADMIN_USER
+          $runnerPass = $env:RUNNERADMIN_PASS
+
+          # Daca ai un user personal pe care vrei sa-l afisezi (MSCuser), incercam sa-l citim din mediul workflow.
+          $mscUser = $env:MSC_USER
+          $mscPass = $env:MSC_PASS
+
+          # Daca variabilele nu exista, incercam sa detectam useri locali (fara a schimba nimic)
+          if (-not $mscUser -or $mscUser.Trim() -eq "") {
+            # incearca sa gasesti un user local cu nume comun "MSCuser" fara a-l modifica
+            $lu = Get-LocalUser -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*MSC*" } | Select-Object -First 1
+            if ($lu) { $mscUser = $lu.Name }
+          }
+
+          # IP Tailscale (daca este instalat)
+          $tsIp = ""
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+            try { $tsIp = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4; $tsIp = $tsIp.Trim() } catch {}
+          }
+
+          Write-Host "=== INFORMATII ACCES RDP ==="
+          if ($mscUser) {
+            if ($mscPass) {
+              Write-Host "User local: $mscUser  / Parola: $mscPass"
+            } else {
+              Write-Host "User local: $mscUser  / Parola: (necunoscuta sau neschimbata)"
+            }
+          } else {
+            Write-Host "User local (MSC) : NU a fost gasit in mediu."
+          }
+
+          if ($runnerUser) {
+            Write-Host "User runneradmin: $runnerUser  / Parola: $runnerPass"
+          } else {
+            Write-Host "User runneradmin: NU a fost exportat (s-ar fi putut produce eroare anterior)."
+          }
+
+          if ($tsIp) { Write-Host "IP Tailscale: $tsIp" } else { Write-Host "IP Tailscale: (nevalabil)" }
+          Write-Host "GPU Fake: NVIDIA GeForce RTX 3060 (WARP Extra Impossible Mode)"
+          Write-Host "============================"
+
+      - name: Maintaining Connection (ping every 10 min) - fixed loop
+        shell: pwsh
+        run: |
+          # loop 432 iteratii * 600s = 259200s = 72 ore
+          for ($i = 0; $i -lt 432; $i++) {
+            Write-Host ("Maintaining Connection... Iteration {0} / 432 - {1}" -f $i, (Get-Date))
+            Start-Sleep -Seconds 600
+          }
+          
