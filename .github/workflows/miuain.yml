@@ -1,0 +1,114 @@
+name: Persistent Windows Server 2025 RDP with Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp-server:
+    runs-on: windows-2025
+    timeout-minutes: 4320  # 72h
+
+    steps:
+      - name: Start VM
+        run: echo "🚀 Starting Windows Server 2025 with Persistent RDP..."
+
+      - name: Enable RDP + Firewall
+        shell: pwsh
+        run: |
+          Write-Output "🔧 Configuring RDP..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          Restart-Service -Name TermService -Force
+          Write-Output "✅ RDP Enabled"
+
+      - name: Reset runneradmin password
+        shell: pwsh
+        run: |
+          Write-Output "👤 Resetting runneradmin password..."
+          function GenPass { -join ((33..126) | Get-Random -Count 14 | % {[char]$_}) }
+          $newPass = GenPass
+          $secure = ConvertTo-SecureString $newPass -AsPlainText -Force
+          try {
+            Set-LocalUser -Name "runneradmin" -Password $secure
+            Write-Output "RUNNERADMIN_PASS=$newPass" >> $env:GITHUB_ENV
+            Write-Output "✅ runneradmin password reset"
+          } catch {
+            Write-Output "❌ Could not reset runneradmin password: $_"
+          }
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          Write-Output "🌐 Installing Tailscale..."
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait
+          Remove-Item $installer -Force
+          Write-Output "✅ Tailscale installed"
+
+      - name: Start Tailscale with Auth Key
+        shell: pwsh
+        run: |
+          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          $host = "gh-server-$env:GITHUB_RUN_ID"
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+            & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$authKey --hostname=$host --accept-routes --accept-dns
+            Start-Sleep -Seconds 5
+            $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Write-Output "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+            Write-Output "✅ Tailscale started with IP: $ip"
+          } else {
+            Write-Output "❌ Tailscale not installed!"
+          }
+
+      - name: Create boot re-enable script (RDP + Tailscale)
+        shell: pwsh
+        run: |
+          $scriptPath = "C:\re_enable_rdp_tailscale.ps1"
+          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          $host = "gh-server-$env:GITHUB_RUN_ID"
+          $content = @'
+Try {
+  Add-Content -Path C:\rdp_status.log -Value "[$(Get-Date -Format o)] - BOOT: Re-enable script running"
+
+  # Enable RDP again
+  Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
+  Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+  Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+  Add-Content -Path C:\rdp_status.log -Value "[$(Get-Date -Format o)] - RDP re-enabled"
+
+  # Start Tailscale again
+  if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+    & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$authKey --hostname=$host --accept-routes --accept-dns
+    Start-Sleep -Seconds 5
+    try {
+      $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+      Add-Content -Path C:\rdp_status.log -Value "[$(Get-Date -Format o)] - Tailscale IP: $ip"
+    } catch {}
+  }
+
+} catch {
+  Add-Content -Path C:\rdp_status.log -Value "[$(Get-Date -Format o)] - ERROR in re-enable script: $_"
+}
+'@
+          $content | Out-File -FilePath $scriptPath -Encoding UTF8 -Force
+          schtasks /Create /TN "ReEnableRDP_Tailscale" /TR "powershell.exe -ExecutionPolicy Bypass -File `"$scriptPath`"" /SC ONSTART /RL HIGHEST /F
+          Write-Output "✅ Boot script + scheduled task created"
+
+      - name: Show access info
+        shell: pwsh
+        run: |
+          $runnerPass = $env:RUNNERADMIN_PASS
+          $ip = $env:TAILSCALE_IP
+          Write-Output "=== 🔑 ACCESS INFO ==="
+          Write-Output "User: runneradmin"
+          Write-Output "Pass: $runnerPass"
+          Write-Output "Tailscale IP: $ip"
+          Write-Output "======================"
+
+      - name: Keep Alive for 72h
+        run: |
+          echo "🛡️ Keeping workflow alive for 72h..."
+          ping -t 127.0.0.1 >nul
+          
