@@ -1,0 +1,124 @@
+name: THISGAMINGRDP Setup with Forced Tesla T4 / Fake RTX 5080
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-gaming-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 4320 # 72 ore
+
+    steps:
+      - name: Assign Tesla T4 GPU or fallback to fake RTX 5080
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $vmName = $env:COMPUTERNAME
+          $vm = Get-VM -Name $vmName -ErrorAction SilentlyContinue
+
+          if ($vm) {
+              Write-Host "VM $vmName exista. Incep configurare GPU..."
+              Stop-VM -Name $vmName -Force
+              Set-VM -Name $vmName -AutomaticStopAction TurnOff
+              Set-VM -VMName $vmName -GuestControlledCacheTypes $true
+              Set-VM -VMName $vmName -LowMemoryMappedIoSpace 3GB
+              Set-VM -VMName $vmName -HighMemoryMappedIoSpace 33280MB
+          } else {
+              Write-Host "VM $vmName nu exista pe host. Vom folosi GPU fake RTX 5080."
+          }
+
+          Write-Host "Detectare GPU NVIDIA real..."
+          $gpuDevices = Get-PnpDevice -PresentOnly | Where-Object {
+              $_.Class -eq "Display" -and $_.Manufacturer -like "*NVIDIA*"
+          }
+
+          $teslaT4 = $gpuDevices | Where-Object { $_.FriendlyName -like "*Tesla T4*" }
+
+          if ($teslaT4) {
+              Write-Host "Tesla T4 gasit! Atașare la VM..."
+              $teslaInstanceId = $teslaT4.InstanceId
+              $teslaLocationPath = (Get-PnpDeviceProperty -InstanceId $teslaInstanceId -KeyName 'DEVPKEY_Device_LocationPaths').Data[0]
+              Add-VMAssignableDevice -LocationPath $teslaLocationPath -VMName $vmName
+              Start-VM -Name $vmName
+              Write-Host "GPU Tesla T4 real a fost atribuit la VM $vmName."
+          } else {
+              Write-Host "Tesla T4 nu a fost gasit. Aplicare GPU fake RTX 5080 peste tot..."
+              # Registry Fake GPU
+              reg add "HKLM\Software\FakeGPU" /v "Name" /t REG_SZ /d "NVIDIA GeForce RTX 5080" /f
+              reg add "HKLM\Software\FakeGPU" /v "VRAM_MB" /t REG_DWORD /d 24576 /f
+              reg add "HKLM\Software\FakeGPU" /v "DriverVersion" /t REG_SZ /d "612.50" /f
+              reg add "HKLM\Software\FakeGPU" /v "CUDA" /t REG_SZ /d "9.2" /f
+              reg add "HKLM\Software\FakeGPU" /v "RayTracing" /t REG_SZ /d "Supported" /f
+              reg add "HKLM\Software\FakeGPU" /v "FakeGPU_ShowInTaskManager" /t REG_DWORD /d 1 /f
+              reg add "HKCU\Software\Microsoft\Direct3D" /v "ForceWarp" /t REG_DWORD /d 1 /f
+          }
+
+      - name: Activeaza Remote Desktop
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Reveal or Reset Runneradmin user
+        shell: pwsh
+        continue-on-error: true
+        env:
+          runneradmin_PASS: ${{ secrets.RUNNERADMIN_PASS || '' }}
+        run: |
+          Add-Type -AssemblyName System.Security
+          function GenPass { -join ((33..126) | Get-Random -Count 16 | % {[char]$_}) }
+          $user = "runneradmin"
+          $existingUser = Get-LocalUser -Name $user -ErrorAction SilentlyContinue
+
+          if (-not $existingUser) { exit 0 }
+
+          if ($env:runneradmin_PASS -and $env:runneradmin_PASS.Trim().Length -gt 0) {
+            Write-Output "RUNNERADMIN_USER=$user" >> $env:GITHUB_ENV
+            Write-Output "RUNNERADMIN_PASS=$env:runneradmin_PASS" >> $env:GITHUB_ENV
+            exit 0
+          }
+
+          $newPass = GenPass
+          $secure = ConvertTo-SecureString $newPass -AsPlainText -Force
+          try { Set-LocalUser -Name $user -Password $secure -ErrorAction Stop } catch {}
+          Write-Output "RUNNERADMIN_USER=$user" >> $env:GITHUB_ENV
+          Write-Output "RUNNERADMIN_PASS=$newPass" >> $env:GITHUB_ENV
+
+      - name: Instaleaza si configureaza Tailscale VPN
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-server-$env:GITHUB_RUN_ID
+
+      - name: Afiseaza datele de acces RDP
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $runnerUser = $env:RUNNERADMIN_USER
+          $runnerPass = $env:RUNNERADMIN_PASS
+          $tsIp = ""
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+            try { $tsIp = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4; $tsIp = $tsIp.Trim() } catch {}
+          }
+          Write-Host "=== INFORMATII ACCES RDP ==="
+          Write-Host "User runneradmin: $runnerUser / Parola: $runnerPass"
+          Write-Host "IP Tailscale: $tsIp"
+          Write-Host "GPU configurat: Tesla T4 real sau Fake RTX 5080"
+          Write-Host "============================"
+
+      - name: Menținere conexiune activă (ping la 10 min)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          for ($i = 0; $i -lt 432; $i++) {
+            Write-Host ("Menținere conexiune... Iterația {0} / 432 - {1}" -f $i, (Get-Date))
+            Start-Sleep -Seconds 600
+          }
+          
