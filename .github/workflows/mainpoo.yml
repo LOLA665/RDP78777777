@@ -1,0 +1,213 @@
+name: Windows Runner Full - RustDesk + RDP Fix + Intel UHD GPU + dxdiag + Artifacts
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rustdesk-full:
+    runs-on: windows-2022
+    timeout-minutes: 360   # 6 hours max for windows-2022 runners
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show initial system snapshot
+        run: |
+          Write-Output "=== INITIAL RUNNER SNAPSHOT ==="
+          Write-Output "Time (UTC): $(Get-Date).ToUniversalTime()"
+          systeminfo | Select-Object -First 8 | ForEach-Object { Write-Output $_ }
+          Get-CimInstance -ClassName Win32_Processor | ForEach-Object { Write-Output ("Processor: " + $_.Name) }
+          Get-CimInstance -ClassName Win32_ComputerSystem | ForEach-Object { Write-Output ("TotalPhysicalMemoryMB: " + ([int]($_.TotalPhysicalMemory / 1MB))) }
+          Get-PSDrive -Name C | ForEach-Object { Write-Output ("C: Free(GB): " + [math]::Round($_.Free/1GB,2)) }
+          Write-Output "==============================="
+
+      - name: Fix common RDP / Firewall issues (PowerShell)
+        run: |
+          Write-Output "=== APPLYING RDP / FIREWALL FIXES ==="
+          # Run as admin (runner already admin)
+          powershell -NoProfile -Command "
+          try {
+            # Enable Remote Desktop (registry)
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -ErrorAction Stop
+            Write-Output 'RDP enabled in registry.'
+
+            # Enable Network Level Authentication (optional)
+            Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1 -ErrorAction SilentlyContinue
+
+            # Ensure Remote Desktop Services is running
+            $svc = Get-Service -Name TermService -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne 'Running') {
+              Start-Service -Name TermService
+              Write-Output 'Started Remote Desktop Services.'
+            } else {
+              Write-Output 'Remote Desktop Services already running.'
+            }
+
+            # Enable Firewall rules for Remote Desktop (all profiles)
+            # 'Remote Desktop - User Mode (TCP-In)' and 'Remote Desktop - User Mode (UDP-In)' typically exist
+            Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue | ForEach-Object {
+              Enable-NetFirewallRule -Name $_.Name -ErrorAction SilentlyContinue
+            }
+            # Fallback: create allow rule for 3389 if group not found
+            $exists = Get-NetFirewallRule -DisplayName 'Allow RDP Inbound from GitHub Actions' -ErrorAction SilentlyContinue
+            if (-not $exists) {
+              New-NetFirewallRule -DisplayName 'Allow RDP Inbound from GitHub Actions' -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow
+            }
+            Write-Output 'Firewall rules applied (RDP).'
+
+            # Make sure WinRM listener exists (helpful if other remote ops needed)
+            try {
+              if (-not (Get-ChildItem -Path WSMan:\Localhost\Listener -ErrorAction SilentlyContinue)) {
+                winrm quickconfig -quiet
+                Write-Output 'WinRM quickconfig executed.'
+              } else {
+                Write-Output 'WinRM listener already present.'
+              }
+            } catch { Write-Output 'WinRM quickconfig error: ' + $_.Exception.Message }
+
+            Write-Output 'RDP/Firewall fixes completed successfully.'
+          } catch {
+            Write-Output 'RDP/Firewall fix encountered an exception: ' + $_.Exception.Message
+          }
+          "
+
+      - name: Detect GPU and other hardware details (explicit Intel fallback)
+        id: detect_hw
+        run: |
+          powershell -NoProfile -Command "
+          $out = @{}
+          $cpu = Get-CimInstance -ClassName Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+          $mem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+          $video = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue
+          $gpu_names = @()
+          if ($video) {
+            foreach ($v in $video) { if ($v.Name) { $gpu_names += $v.Name.Trim() } }
+          }
+          # prefer Intel if present
+          $gpu_final = $null
+          if ($gpu_names -and ($gpu_names -match 'Intel')) {
+            $gpu_final = ($gpu_names | Where-Object { $_ -match 'Intel' } ) -join '; '
+          } elseif ($gpu_names -and $gpu_names.Count -gt 0) {
+            $gpu_final = ($gpu_names -join '; ')
+          } else {
+            # fallback to explicit requested label
+            $gpu_final = 'Intel(R) UHD Graphics'
+          }
+
+          $out.CPU = $cpu.Name
+          $out.TotalPhysicalMemoryMB = [int]($mem.TotalPhysicalMemory / 1MB)
+          $out.GPU = $gpu_final
+          $out | ConvertTo-Json -Compress
+          " > hw.json
+          cat hw.json
+          # Export gpu name to file for artifact
+          powershell -NoProfile -Command "
+            $j = Get-Content hw.json | ConvertFrom-Json
+            Set-Content -Path '$env:GITHUB_WORKSPACE\gpu_name.txt' -Value $j.GPU -Force
+          "
+
+      - name: Download & install RustDesk (portable) and start it
+        run: |
+          powershell -NoProfile -Command "
+          Write-Output 'Downloading RustDesk...'
+          $url = 'https://github.com/rustdesk/rustdesk/releases/latest/download/rustdesk-1.2.0-windows-x86_64.zip'
+          $zip = Join-Path $env:TEMP 'rustdesk.zip'
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop
+            Expand-Archive -LiteralPath $zip -DestinationPath 'C:\RustDesk' -Force
+            Write-Output 'RustDesk downloaded and extracted.'
+          } catch {
+            Write-Output 'RustDesk download/extract failed: ' + $_.Exception.Message
+          }
+
+          $exe = Get-ChildItem 'C:\RustDesk' -Filter 'rustdesk*.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($exe) {
+            # start rustdesk as hidden process (tray)
+            Start-Process -FilePath $exe.FullName -ArgumentList '--tray' -WindowStyle Hidden
+            Write-Output 'RustDesk started.'
+          } else {
+            Write-Output 'RustDesk executable not found after extraction.'
+          }
+          "
+
+      - name: Wait and capture RustDesk ID
+        id: rustdesk_id
+        run: |
+          powershell -NoProfile -Command "
+          Start-Sleep -Seconds 15
+          $paths = @(
+            Join-Path $env:APPDATA 'rustdesk\id',
+            Join-Path $env:APPDATA 'RustDesk\id',
+            Join-Path $env:LOCALAPPDATA 'RustDesk\id'
+          )
+          $id = $null
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              try { $id = Get-Content $p -Raw -ErrorAction Stop; break } catch {}
+            }
+          }
+          # fallback: search for any 'id' file quickly under AppData
+          if (-not $id) {
+            try {
+              $found = Get-ChildItem -Path $env:APPDATA -Recurse -Filter 'id' -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) { $id = Get-Content $found.FullName -Raw }
+            } catch {}
+          }
+          if (-not $id) { $id = 'NOT_FOUND' }
+          # save to workspace file and to output
+          Set-Content -Path (Join-Path $env:GITHUB_WORKSPACE 'rustdesk_id.txt') -Value $id -Force
+          Write-Output ('rustdesk_id=' + $id) >> $env:GITHUB_OUTPUT
+          Write-Output ('Detected RustDesk ID: ' + $id)
+          "
+
+      - name: Generate RustDesk password and save
+        id: gen_pass
+        run: |
+          powershell -NoProfile -Command "
+          $chars = (33..126) | ForEach-Object {[char]$_}
+          $pass = -join (Get-Random -Count 12 -InputObject $chars)
+          Set-Content -Path (Join-Path $env:GITHUB_WORKSPACE 'rustdesk_pass.txt') -Value $pass -Force
+          Write-Output ('rustdesk_password=' + $pass) >> $env:GITHUB_OUTPUT
+          Write-Output ('Generated RustDesk password saved to rustdesk_pass.txt')
+          "
+
+      - name: Run dxdiag snapshot and copy to workspace
+        run: |
+          powershell -NoProfile -Command "
+          $out = 'C:\dxdiag_output.txt'
+          Write-Output 'Running dxdiag (this may take a few seconds)...'
+          dxdiag /t $out > $null 2>&1
+          # copy to workspace (overwrite if exists)
+          Copy-Item -Path $out -Destination (Join-Path $env:GITHUB_WORKSPACE 'dxdiag_output.txt') -Force -ErrorAction SilentlyContinue
+          Write-Output 'dxdiag snapshot copied to workspace as dxdiag_output.txt'
+          "
+
+      - name: Show summary in logs
+        run: |
+          Write-Output "=== SUMMARY ==="
+          Write-Output ("RustDesk ID   : " + (Get-Content rustdesk_id.txt))
+          Write-Output ("RustDesk Pass : " + (Get-Content rustdesk_pass.txt))
+          Write-Output ("GPU Reported  : " + (Get-Content gpu_name.txt))
+          Write-Output "System snapshot (first lines dxdiag):"
+          head -n 20 dxdiag_output.txt || Write-Output 'dxdiag not available'
+          Write-Output "================"
+
+      - name: Upload artifacts (dxdiag + rustdesk files)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-connection-info
+          path: |
+            rustdesk_id.txt
+            rustdesk_pass.txt
+            gpu_name.txt
+            dxdiag_output.txt
+
+      - name: Keep workflow alive (up to 6h)
+        run: |
+          powershell -NoProfile -Command "
+          Write-Output 'Keeping runner alive for up to 6 hours. Cancel workflow manually to stop earlier.'
+          Start-Sleep -Seconds 21600
+          Write-Output 'Runner sleep finished (or canceled earlier).'
+          "
+          
