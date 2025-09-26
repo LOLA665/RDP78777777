@@ -1,0 +1,227 @@
+name: Windows Runner + RustDesk + Tailscale (secure RDP) + dxdiag + Encrypted Password
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rustdesk-tailscale:
+    runs-on: windows-2022
+    timeout-minutes: 360   # 6 hours
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show initial snapshot
+        run: |
+          powershell -NoProfile -Command "
+          Write-Output '=== INITIAL RUNNER SNAPSHOT ==='
+          Write-Output ('Time (UTC): ' + (Get-Date).ToUniversalTime())
+          systeminfo | Select-Object -First 6 | ForEach-Object { Write-Output $_ }
+          Get-CimInstance -ClassName Win32_Processor | ForEach-Object { Write-Output ('Processor: ' + $_.Name) }
+          Get-CimInstance -ClassName Win32_ComputerSystem | ForEach-Object { Write-Output ('TotalPhysicalMemoryMB: ' + ([int]($_.TotalPhysicalMemory / 1MB))) }
+          Get-PSDrive -Name C | ForEach-Object { Write-Output ('C: Free(GB): ' + [math]::Round($_.Free/1GB,2)) }
+          Write-Output '==============================='
+          "
+
+      - name: Fix RDP & prepare firewall for Tailscale (PowerShell)
+        run: |
+          powershell -NoProfile -Command "
+          try {
+            Write-Output 'Applying RDP settings...'
+            # Enable Remote Desktop (allow connections)
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -ErrorAction Stop
+            Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1 -ErrorAction SilentlyContinue
+
+            # Ensure Remote Desktop Service is running
+            $svc = Get-Service -Name TermService -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne 'Running') { Start-Service -Name TermService; Write-Output 'Started TermService.' } else { Write-Output 'TermService running.' }
+
+            # Remove any overly-broad RDP firewall rules created previously (safety)
+            try {
+              Get-NetFirewallRule -DisplayName 'Allow RDP Inbound from GitHub Actions' -ErrorAction SilentlyContinue | ForEach-Object { Remove-NetFirewallRule -Name $_.Name -Confirm:$false -ErrorAction SilentlyContinue }
+            } catch {}
+
+            # Add a firewall rule allowing RDP (3389) only from Tailscale IP block 100.64.0.0/10
+            $existing = Get-NetFirewallRule -DisplayName 'Allow RDP from Tailscale' -ErrorAction SilentlyContinue
+            if ($null -eq $existing) {
+              New-NetFirewallRule -DisplayName 'Allow RDP from Tailscale' -Direction Inbound -Protocol TCP -LocalPort 3389 -RemoteAddress '100.64.0.0/10' -Action Allow
+              Write-Output 'Created firewall rule: Allow RDP from Tailscale (100.64.0.0/10).'
+            } else {
+              Write-Output 'Firewall rule Allow RDP from Tailscale already exists.'
+            }
+
+            # Ensure WinRM listener exists (in case needed)
+            try {
+              if (-not (Get-ChildItem -Path WSMan:\Localhost\Listener -ErrorAction SilentlyContinue)) { winrm quickconfig -quiet; Write-Output 'WinRM quickconfig executed.' } else { Write-Output 'WinRM listener present.' }
+            } catch { Write-Output 'WinRM quickconfig issue: ' + $_.Exception.Message }
+
+            Write-Output 'RDP & firewall preparation complete.'
+          } catch {
+            Write-Output 'RDP/Firewall setup error: ' + $_.Exception.Message
+            exit 1
+          }
+          "
+
+      - name: Install Tailscale (Windows) and bring up with authkey
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          powershell -NoProfile -Command "
+          if (-not $env:TAILSCALE_AUTHKEY -or $env:TAILSCALE_AUTHKEY -eq '') { Write-Output 'ERROR: TAILSCALE_AUTHKEY secret is not set.'; exit 2 }
+          Write-Output 'Downloading Tailscale installer...'
+          $installer = Join-Path $env:TEMP 'tailscale-setup.exe'
+          $url = 'https://pkgs.tailscale.com/stable/tailscale-setup.exe'
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing -ErrorAction Stop
+            Write-Output 'Installer downloaded.'
+          } catch { Write-Output 'Failed to download Tailscale installer: ' + $_.Exception.Message; exit 3 }
+
+          Write-Output 'Running installer (quiet)...'
+          # Run installer (may register service)
+          Start-Process -FilePath $installer -ArgumentList '/S' -Wait -NoNewWindow
+          Start-Sleep -Seconds 3
+
+          # Start tailscaled service if present
+          try {
+            if (Get-Service -Name tailscaled -ErrorAction SilentlyContinue) {
+              Start-Service -Name tailscaled -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 3
+            }
+          } catch {}
+
+          # run tailscale up with the authkey
+          $tsExe = (Get-Command tailscale.exe -ErrorAction SilentlyContinue).Source
+          if (-not $tsExe) {
+            # fallback to typical install path
+            $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
+          }
+          if (-not (Test-Path $tsExe)) { Write-Output 'Tailscale CLI not found at ' + $tsExe; exit 4 }
+
+          Write-Output 'Bringing Tailscale up with authkey (this will register the node in your admin console)...'
+          & $tsExe up --authkey=$env:TAILSCALE_AUTHKEY --accept-routes --hostname "gh-runner-${{ github.run_id }}" 2>&1 | Write-Output
+          Start-Sleep -Seconds 3
+
+          # Get the Tailscale IPv4 address
+          $ip = (& $tsExe ip -4 2>$null) -join ' '
+          if ($ip) {
+            Write-Output 'Tailscale IPv4:' + $ip
+            Set-Content -Path (Join-Path $env:GITHUB_WORKSPACE 'tailscale_ip.txt') -Value $ip -Force
+          } else {
+            Write-Output 'Could not determine Tailscale IP yet. Use `tailscale status` in logs.'
+            & $tsExe status 2>&1 | Write-Output
+          }
+          "
+
+      - name: Detect GPU & save GPU name
+        id: detect_gpu
+        run: |
+          powershell -NoProfile -Command "
+          $video = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue
+          $gpu_names = @()
+          if ($video) { foreach ($v in $video) { if ($v.Name) { $gpu_names += $v.Name.Trim() } } }
+          if ($gpu_names -and ($gpu_names -match 'Intel')) { $gpu_final = ($gpu_names | Where-Object { $_ -match 'Intel' }) -join '; ' }
+          elseif ($gpu_names -and $gpu_names.Count -gt 0) { $gpu_final = $gpu_names -join '; ' }
+          else { $gpu_final = 'Intel(R) UHD Graphics' }
+          Set-Content -Path (Join-Path $env:GITHUB_WORKSPACE 'gpu_name.txt') -Value $gpu_final -Force
+          Write-Output 'Detected GPU: ' + $gpu_final
+          "
+
+      - name: Download & start RustDesk
+        run: |
+          powershell -NoProfile -Command "
+          $url='https://github.com/rustdesk/rustdesk/releases/latest/download/rustdesk-1.2.0-windows-x86_64.zip'
+          $zip=Join-Path $env:TEMP 'rustdesk.zip'
+          try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop } catch { Write-Output 'RustDesk download failed: ' + $_.Exception.Message }
+          try { Expand-Archive -LiteralPath $zip -DestinationPath 'C:\RustDesk' -Force } catch {}
+          $exe=Get-ChildItem 'C:\RustDesk' -Filter 'rustdesk*.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($exe) { Start-Process -FilePath $exe.FullName -ArgumentList '--tray' -WindowStyle Hidden; Write-Output 'RustDesk started.' } else { Write-Output 'RustDesk exe not found.' }
+          "
+
+      - name: Capture RustDesk ID
+        id: rustdesk_id
+        run: |
+          powershell -NoProfile -Command "
+          Start-Sleep -Seconds 15
+          $paths=@(Join-Path $env:APPDATA 'rustdesk\id', Join-Path $env:APPDATA 'RustDesk\id', Join-Path $env:LOCALAPPDATA 'RustDesk\id')
+          $id=$null
+          foreach ($p in $paths) { if (Test-Path $p) { try { $id=Get-Content $p -Raw; break } catch {} } }
+          if (-not $id) { $id='NOT_FOUND' }
+          Set-Content -Path (Join-Path $env:GITHUB_WORKSPACE 'rustdesk_id.txt') -Value $id -Force
+          Write-Output ('rustdesk_id=' + $id) >> $env:GITHUB_OUTPUT
+          Write-Output 'RustDesk ID captured: ' + $id
+          "
+
+      - name: Generate RustDesk password (save plaintext then encrypt)
+        run: |
+          powershell -NoProfile -Command "
+          $chars=(33..126|ForEach-Object {[char]$_})
+          $pass=-join (Get-Random -Count 14 -InputObject $chars)
+          Set-Content -Path (Join-Path $env:GITHUB_WORKSPACE 'rustdesk_pass.txt') -Value $pass -Force
+          Write-Output 'Password generated and saved to rustdesk_pass.txt (will be encrypted next step).'
+          "
+
+      - name: Encrypt RustDesk password
+        env:
+          RUSTDESK_ARTIFACT_KEY: ${{ secrets.RUSTDESK_ARTIFACT_KEY }}
+        run: |
+          pwsh -NoProfile -Command "
+          if (-not $env:RUSTDESK_ARTIFACT_KEY -or $env:RUSTDESK_ARTIFACT_KEY -eq '') { Write-Output 'ERROR: RUSTDESK_ARTIFACT_KEY is not set.'; exit 2 }
+          $keyBytes = [System.Text.Encoding]::UTF8.GetBytes($env:RUSTDESK_ARTIFACT_KEY)
+          if ($keyBytes.Length -lt 16) { Write-Output 'ERROR: RUSTDESK_ARTIFACT_KEY must be at least 16 bytes long.'; exit 3 }
+          # Truncate or expand to 32 bytes for AES-256 key
+          $aesKey = New-Object byte[] 32
+          [Array]::Copy($keyBytes, $aesKey, [Math]::Min($keyBytes.Length,32))
+          $iv = New-Object byte[] 16
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($iv)
+          $aes = [System.Security.Cryptography.Aes]::Create()
+          $aes.KeySize = 256
+          $aes.Key = $aesKey
+          $aes.IV = $iv
+          $aes.Mode = 'CBC'
+          $aes.Padding = 'PKCS7'
+          $plaintext = Get-Content rustdesk_pass.txt -Raw
+          $enc = $aes.CreateEncryptor().TransformFinalBlock([System.Text.Encoding]::UTF8.GetBytes($plaintext),0,[System.Text.Encoding]::UTF8.GetBytes($plaintext).Length)
+          $out = New-Object System.IO.MemoryStream
+          $out.Write($iv,0,16)
+          $out.Write($enc,0,$enc.Length)
+          Set-Content -Path rustdesk_pass.enc -Encoding Byte -Value $out.ToArray()
+          Remove-Item rustdesk_pass.txt -Force -ErrorAction SilentlyContinue
+          Write-Output 'Password encrypted to rustdesk_pass.enc'
+          "
+
+      - name: Run dxdiag snapshot
+        run: |
+          powershell -NoProfile -Command "
+          $out='C:\dxdiag_output.txt'
+          dxdiag /t $out > $null 2>&1
+          Copy-Item -Path $out -Destination (Join-Path $env:GITHUB_WORKSPACE 'dxdiag_output.txt') -Force -ErrorAction SilentlyContinue
+          Write-Output 'dxdiag snapshot copied.'
+          "
+
+      - name: Show summary (Tailscale IP, RustDesk ID)
+        run: |
+          powershell -NoProfile -Command "
+          Write-Output '=== SUMMARY ==='
+          if (Test-Path (Join-Path $env:GITHUB_WORKSPACE 'tailscale_ip.txt')) { Write-Output ('Tailscale IP: ' + (Get-Content tailscale_ip.txt)) } else { Write-Output 'Tailscale IP: (not available yet)' }
+          Write-Output ('RustDesk ID   : ' + (Get-Content rustdesk_id.txt))
+          Write-Output 'RustDesk Pass  : (encrypted in artifact rustdesk_pass.enc)'
+          Write-Output ('GPU Reported   : ' + (Get-Content gpu_name.txt))
+          Write-Output '================'
+          "
+
+      - name: Upload artifacts (encrypted password)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-connection-info
+          path: |
+            rustdesk_id.txt
+            rustdesk_pass.enc
+            gpu_name.txt
+            dxdiag_output.txt
+            tailscale_ip.txt
+
+      - name: Keep workflow alive (up to 6h)
+        run: |
+          powershell -NoProfile -Command "Write-Output 'Keeping runner alive for up to 6 hours. Cancel workflow manually to stop earlier.'; Start-Sleep -Seconds 21600; Write-Output 'Runner sleep finished.'"
+          
