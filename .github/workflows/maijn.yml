@@ -1,0 +1,105 @@
+name: RDP Gaming Server Windows (My Summer Car Extra Impossible Mode Fake GPU)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp-gaming:
+    runs-on: windows-2022
+    timeout-minutes: 4320  # 72 ore
+
+    steps:
+      - name: Extra Impossible Mode GPU Fake RTX 3060 + WARP Max
+        shell: pwsh
+        run: |
+          Write-Host "=== Extra Impossible Mode: GPU Fake RTX 3060 + WARP Max Ultra pentru My Summer Car ==="
+
+          # Force WARP software rendering
+          reg add "HKCU\Software\Microsoft\Direct3D" /v "ForceWarp" /t REG_DWORD /d 1 /f
+
+          # Fake GPU info
+          reg add "HKLM\Software\FakeGPU" /v "Name" /t REG_SZ /d "NVIDIA GeForce RTX 3060" /f
+          reg add "HKLM\Software\FakeGPU" /v "VRAM_MB" /t REG_DWORD /d 16384 /f
+          reg add "HKLM\Software\FakeGPU" /v "Bandwidth_MBps" /t REG_DWORD /d 500000 /f
+          reg add "HKLM\Software\FakeGPU" /v "DriverVersion" /t REG_SZ /d "546.33" /f
+          reg add "HKLM\Software\FakeGPU" /v "CUDA" /t REG_SZ /d "8.6" /f
+          reg add "HKLM\Software\FakeGPU" /v "RayTracing" /t REG_SZ /d "Supported" /f
+
+          # High Performance Power + Timer tweaks
+          powercfg /setactive SCHEME_MIN
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Kernel" /v "GlobalTimerResolutionRequests" /t REG_DWORD /d 1 /f
+
+          # CPU RealTime Priority + all cores affinity
+          $proc = Get-Process -Id $PID
+          $proc.PriorityClass = "Realtime"
+
+          # Registry tweaks WARP extra ultra
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "ThreadCount" /t REG_DWORD /d 128 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "MaxConcurrency" /t REG_DWORD /d 64 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "UseHighPrecision" /t REG_DWORD /d 1 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "EnableCommandLists" /t REG_DWORD /d 1 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "EnableAdaptiveCommandLists" /t REG_DWORD /d 1 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "EnableMaxPerformanceMode" /t REG_DWORD /d 1 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "DisableDebugLayers" /t REG_DWORD /d 1 /f
+
+          # Opri complet toate serviciile inutile
+          Stop-Service -Name "DiagTrack","WSearch","SysMain","MapsBroker","PrintNotify","Spooler" -ErrorAction SilentlyContinue
+
+          Write-Host "GPU Fake RTX 3060 activat + WARP Extra Impossible Mode (>50FPS teoretic) pentru My Summer Car"
+
+      - name: Activeaza Remote Desktop
+        shell: pwsh
+        run: |
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: RevealOrResetRunneradmin
+        shell: pwsh
+        env:
+          runneradmin_PASS: ${{ secrets.RUNNERADMIN_PASS || '' }}
+        run: |
+          Add-Type -AssemblyName System.Security
+          function GenPass { -join ((33..126) | Get-Random -Count 16 | % {[char]$_}) }
+          $user = "runneradmin"
+          $existingUser = Get-LocalUser -Name $user -ErrorAction SilentlyContinue
+          if (-not $existingUser) { exit 0 }
+          if ($env:runneradmin_PASS -and $env:runneradmin_PASS.Trim().Length -gt 0) {
+            Write-Output "RUNNERADMIN_USER=$user" >> $env:GITHUB_ENV
+            Write-Output "RUNNERADMIN_PASS=$env:runneradmin_PASS" >> $env:GITHUB_ENV
+            exit 0
+          }
+          $newPass = GenPass
+          $secure = ConvertTo-SecureString $newPass -AsPlainText -Force
+          Set-LocalUser -Name $user -Password $secure
+          Write-Output "RUNNERADMIN_USER=$user" >> $env:GITHUB_ENV
+          Write-Output "RUNNERADMIN_PASS=$newPass" >> $env:GITHUB_ENV
+
+      - name: Instaleaza si configureaza Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-server-$env:GITHUB_RUN_ID
+
+      - name: Afiseaza datele de conectare si IP Tailscale
+        shell: pwsh
+        run: |
+          $tsIp = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          $tsIp = $tsIp.Trim()
+          Write-Host "=== INFORMATII ACCES RDP ==="
+          Write-Host "GPU Fake: NVIDIA GeForce RTX 3060 (WARP Extra Impossible Mode)"
+          Write-Host "User si parola runneradmin au fost afisate in pasul anterior"
+          Write-Host "IP Tailscale: $tsIp"
+          Write-Host "============================"
+
+      - name: Maintaining Connection (ping every 10 min)
+        shell: pwsh
+        run: |
+          for ($i=0; $i -lt 432; $i++) { 
+            Write-Host "Maintaining Connection... Iteration $i"
+            Start-Sleep -Seconds 600
+            
