@@ -1,0 +1,95 @@
+name: RDP Gaming Server Windows Server (Fake RTX 3060 WARP Optimized)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp-gaming:
+    runs-on: windows-2022
+    timeout-minutes: 4320  # 72 ore
+
+    steps:
+      - name: Activeaza Fake RTX 3060 GPU (WARP Optimized)
+        run: |
+          Write-Host "Activare GPU Fake RTX 3060 cu WARP optimizat"
+          reg add "HKCU\Software\Microsoft\Direct3D" /v "ForceWarp" /t REG_DWORD /d 1 /f
+          reg add "HKLM\Software\FakeGPU" /v "Name" /t REG_SZ /d "NVIDIA GeForce RTX 3060" /f
+          reg add "HKLM\Software\FakeGPU" /v "VRAM_MB" /t REG_DWORD /d 12288 /f
+          reg add "HKLM\Software\FakeGPU" /v "DriverVersion" /t REG_SZ /d "546.33" /f
+          reg add "HKLM\Software\FakeGPU" /v "CUDA" /t REG_SZ /d "8.6" /f
+          reg add "HKLM\Software\FakeGPU" /v "RayTracing" /t REG_SZ /d "Supported" /f
+          powercfg /setactive SCHEME_MIN
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Kernel" /v "GlobalTimerResolutionRequests" /t REG_DWORD /d 1 /f
+          Write-Host "GPU Fake RTX 3060 activat si WARP optimizat"
+
+      - name: Activeaza Remote Desktop
+        run: |
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Creeaza useri cu parole random, schimba parola runneradmin daca exista
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Security
+          function GenPass { -join ((33..126) | Get-Random -Count 16 | % {[char]$_}) }
+
+          $userRTX = "RTXuser"
+          if (Get-LocalUser -Name $userRTX -ErrorAction SilentlyContinue) {
+            Remove-LocalGroupMember -Group Administrators -Member $userRTX -ErrorAction SilentlyContinue
+            Remove-LocalGroupMember -Group "Remote Desktop Users" -Member $userRTX -ErrorAction SilentlyContinue
+            Remove-LocalUser -Name $userRTX -ErrorAction SilentlyContinue
+          }
+          $passRTX = GenPass
+          $secPassRTX = ConvertTo-SecureString $passRTX -AsPlainText -Force
+          New-LocalUser -Name $userRTX -Password $secPassRTX -AccountNeverExpires -ErrorAction Stop
+          Add-LocalGroupMember -Group Administrators -Member $userRTX -ErrorAction Stop
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $userRTX -ErrorAction Stop
+          echo "RTXuser_USER=$userRTX" >> $env:GITHUB_ENV
+          echo "RTXuser_PASS=$passRTX" >> $env:GITHUB_ENV
+
+          $userRunner = "runneradmin"
+          if (Get-LocalUser -Name $userRunner -ErrorAction SilentlyContinue) {
+            $passRunner = GenPass
+            $secPassRunner = ConvertTo-SecureString $passRunner -AsPlainText -Force
+            Set-LocalUser -Name $userRunner -Password $secPassRunner -ErrorAction Stop
+            echo "runneradmin_USER=$userRunner" >> $env:GITHUB_ENV
+            echo "runneradmin_PASS=$passRunner" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "User $userRunner nu exista. Parola nu a fost schimbata."
+          }
+
+      - name: Instaleaza si configureaza Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-server-$env:GITHUB_RUN_ID
+
+      - name: Afiseaza datele de conectare si IP Tailscale
+        shell: pwsh
+        run: |
+          $tsIp = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          $tsIp = $tsIp.Trim()
+          Write-Host "=== INFORMATII ACCES RDP ==="
+          Write-Host "GPU Fake: NVIDIA GeForce RTX 3060 (WARP Software)"
+          Write-Host "User RTXuser: $env:RTXuser_USER / Pass: $env:RTXuser_PASS"
+          if ($env:runneradmin_USER) {
+            Write-Host "User runneradmin: $env:runneradmin_USER / Pass: $env:runneradmin_PASS"
+          } else {
+            Write-Host "User runneradmin nu exista sau parola nu a fost schimbata."
+          }
+          Write-Host "IP Tailscale: $tsIp"
+          Write-Host "============================"
+
+      - name: Maintaining Connection (ping every 10 min)
+        shell: pwsh
+        run: |
+          for ($i=0; $i -lt 432; $i++) { # 432 * 10min = 72h
+            Write-Host "Maintaining Connection... Iteration $i"
+            Start-Sleep -Seconds 600
+          }
+          
