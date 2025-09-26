@@ -1,0 +1,101 @@
+name: RDP Server Windows Server 2025 cu 5 GPU partitions
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-hyperv-gpu-p:
+    runs-on: windows-2025
+    timeout-minutes: 4320
+
+    steps:
+      - name: Setup initial script and configuration
+        shell: pwsh
+        run: |
+          $scriptPath = "C:\Scripts\StartupConfig.ps1"
+          if (-not (Test-Path C:\Scripts)) { New-Item -ItemType Directory -Path C:\Scripts -Force }
+
+          # Construim scriptul PowerShell cu toate setarile plus partiționare GPU
+          $scriptContent = @"
+# Setare maxim RDP FPS 60
+New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations' -Name 'DWMFRAMEINTERVAL' -Value 15 -PropertyType DWORD -Force
+
+# Fake GPU RTX 3060 WARP
+reg add "HKCU\Software\Microsoft\Direct3D" /v "ForceWarp" /t REG_DWORD /d 1 /f
+reg add "HKLM\Software\FakeGPU" /v "Name" /t REG_SZ /d "NVIDIA GeForce RTX 3060" /f
+reg add "HKLM\Software\FakeGPU" /v "VRAM_MB" /t REG_DWORD /d 12288 /f
+reg add "HKLM\Software\FakeGPU" /v "DriverVersion" /t REG_SZ /d "546.33" /f
+reg add "HKLM\Software\FakeGPU" /v "CUDA" /t REG_SZ /d "8.6" /f
+reg add "HKLM\Software\FakeGPU" /v "RayTracing" /t REG_SZ /d "Supported" /f
+powercfg /setactive SCHEME_MIN
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Kernel" /v "GlobalTimerResolutionRequests" /t REG_DWORD /d 1 /f
+
+# Activare RDP
+Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389
+Restart-Service -Name TermService -Force
+
+# Creare useri cu parole random
+function GenPass { -join ((33..126) | Get-Random -Count 16 | % {[char]$_}) }
+$userRTX = "RTXuser"
+if (Get-LocalUser -Name $userRTX -ErrorAction SilentlyContinue) {
+  Remove-LocalGroupMember -Group Administrators -Member $userRTX -ErrorAction SilentlyContinue
+  Remove-LocalGroupMember -Group "Remote Desktop Users" -Member $userRTX -ErrorAction SilentlyContinue
+  Remove-LocalUser -Name $userRTX -ErrorAction SilentlyContinue
+}
+$passRTX = GenPass
+$secPassRTX = ConvertTo-SecureString $passRTX -AsPlainText -Force
+New-LocalUser -Name $userRTX -Password $secPassRTX -AccountNeverExpires -ErrorAction Stop
+Add-LocalGroupMember -Group Administrators -Member $userRTX -ErrorAction Stop
+Add-LocalGroupMember -Group "Remote Desktop Users" -Member $userRTX -ErrorAction Stop
+
+$runneradmin = "runneradmin"
+if (Get-LocalUser -Name $runneradmin -ErrorAction SilentlyContinue) {
+  $passRunner = GenPass
+  $secPassRunner = ConvertTo-SecureString $passRunner -AsPlainText -Force
+  Set-LocalUser -Name $runneradmin -Password $secPassRunner -ErrorAction Stop
+}
+
+# Instalare si pornire Tailscale
+$tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+$installerPath = "$env:TEMP\tailscale.msi"
+Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+Remove-Item $installerPath -Force
+& "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey='${{ secrets.TAILSCALE_AUTH_KEY }}' --hostname=gh-rdp-server
+
+# GPU Partitioning configurare 5 partiții pe primul GPU detectat
+$gpuName = (Get-VMHostPartitionableGpu)[0].Name
+Set-VMHostPartitionableGpu -Name $gpuName -PartitionCount 5
+
+# Asignare o particiție GPU VM-ului curent (presupunem numele VM)
+$vmName = (Get-VM).Name | Select-Object -First 1
+Add-VMGpuPartitionAdapter -VMName $vmName
+
+# Afisare IP Tailscale
+$tsIp = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+Write-Host "IP Tailscale: $tsIp"
+"@
+
+          $scriptContent | Out-File -FilePath $scriptPath -Encoding utf8 -Force
+
+          # Programare task la pornire
+          $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -File `"$scriptPath`""
+          $trigger = New-ScheduledTaskTrigger -AtStartup
+          $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+          $task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal
+          Register-ScheduledTask -TaskName "StartupConfig" -InputObject $task -Force
+
+          Write-Host "Startup script și task programat configurate cu succes."
+
+      - name: Confirmare stare RDP, Tailscale si GPU partitions
+        shell: pwsh
+        run: |
+          $tsIp = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          Write-Host "IP Tailscale: $tsIp"
+          $rdpState = Get-Service -Name TermService
+          Write-Host "Stare serviciu Remote Desktop: $($rdpState.Status)"
+          $gpuPartitions = Get-VMGpuPartitionAdapter
+          Write-Host "Numar GPU Partitions asignate:"
+          $gpuPartitions | Format-Table -Property VMName, PartitionId, PartitionVram -AutoSize
+          
