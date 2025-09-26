@@ -1,0 +1,234 @@
+name: Persistent Windows Server 2025 RDP + Tailscale (use runneradmin)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  persistent-rdp-runneradmin:
+    runs-on: windows-2025
+    timeout-minutes: 4320   # 72 ore
+    env:
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      # RUNNERADMIN_PASS should have been exported in a prior step to GITHUB_ENV,
+      # or you may set it as a repo secret and reference here instead:
+      # RUNNERADMIN_PASS: ${{ secrets.RUNNERADMIN_PASS }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Header
+        shell: pwsh
+        run: |
+          Write-Host "=== Persistent Windows Server 2025 RDP + Tailscale (runneradmin) ==="
+          Write-Host "Run id: $env:GITHUB_RUN_ID"
+          Write-Host "Time: $(Get-Date -Format o)"
+
+      - name: Verify runneradmin exists and read password from env
+        id: verify
+        shell: pwsh
+        run: |
+          $user = "runneradmin"
+          $exists = (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) -ne $null
+          if (-not $exists) {
+            Write-Host "ERROR: Local user 'runneradmin' not found on this machine."
+            exit 1
+          }
+          # Attempt to read password from env
+          $pw = $env:RUNNERADMIN_PASS
+          if (-not $pw -or $pw.Trim() -eq "") {
+            Write-Host "WARN: RUNNERADMIN_PASS not found in environment. If you want the workflow to print the password, export RUNNERADMIN_PASS before running this workflow."
+            # do NOT fail, continue; we'll still continue using runneradmin account but password may be unavailable
+            echo "HAS_PASS=false" >> $env:GITHUB_ENV
+          } else {
+            echo "HAS_PASS=true" >> $env:GITHUB_ENV
+            # export to step outputs for other steps if needed
+            echo "RUNNERADMIN_PASS=$pw" >> $env:GITHUB_ENV
+          }
+          Write-Host "Runneradmin exists: $exists"
+
+      - name: Enable RDP & Firewall rules (persist)
+        shell: pwsh
+        run: |
+          Write-Host "Enabling RDP in registry and opening firewall rules..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          # Ensure Network Level Auth allowed
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+          # enable firewall rules for Remote Desktop if present
+          try {
+            Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction Stop | Enable-NetFirewallRule -ErrorAction SilentlyContinue
+          } catch {
+            Write-Host "Could not enumerate firewall DisplayGroup 'Remote Desktop' (may vary by image). Attempting common rule enables..."
+            Get-NetFirewallRule | Where-Object { $_.DisplayName -like "*Remote Desktop*" } | Enable-NetFirewallRule -ErrorAction SilentlyContinue
+          }
+          # ensure TermService is set to automatic and started
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+          Write-Host "RDP enabled and TermService started."
+
+      - name: Install Tailscale (stable) and 'up' using auth key
+        shell: pwsh
+        run: |
+          Write-Host "Installing Tailscale..."
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+          $out = "$env:TEMP\tailscale-setup.exe"
+          (New-Object System.Net.WebClient).DownloadFile($url, $out)
+          Start-Process -FilePath $out -ArgumentList "/quiet" -Wait
+          Remove-Item $out -Force -ErrorAction SilentlyContinue
+          if (-not $env:TAILSCALE_AUTH_KEY -or $env:TAILSCALE_AUTH_KEY -eq "") {
+            Write-Host "ERROR: TAILSCALE_AUTH_KEY secret missing. Please add it in repo secrets."
+            exit 1
+          }
+          $host = "gh-server-$env:GITHUB_RUN_ID"
+          Write-Host "Bringing up Tailscale with hostname: $host"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=$host --accept-routes --accept-dns 2>&1 | ForEach-Object { Write-Host $_ }
+          Start-Sleep -Seconds 5
+          try {
+            $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            $ip = $ip.Trim()
+            echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+            Write-Host "Tailscale IP: $ip"
+          } catch {
+            Write-Host "WARN: could not read tailscale ip yet."
+          }
+
+      - name: Create boot re-enable script for RDP + Tailscale (uses RUNNERADMIN_PASS if present)
+        shell: pwsh
+        run: |
+          $scriptPath = "C:\re_enable_rdp_tailscale.ps1"
+          $authKey = $env:TAILSCALE_AUTH_KEY
+          $host = "gh-server-$env:GITHUB_RUN_ID"
+          $runnerPass = $env:RUNNERADMIN_PASS
+          $content = @"
+Try {
+  Add-Content -Path C:\rdp_status.log -Value ""[$(Get-Date -Format o)] - BOOT: Running re-enable script""
+  # Ensure RDP on
+  Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+  Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+  Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+  Add-Content -Path C:\rdp_status.log -Value ""[$(Get-Date -Format o)] - RDP re-enabled""
+
+  # Tailscale up if installed
+  if (Test-Path '$env:ProgramFiles\Tailscale\tailscale.exe') {
+    & '$env:ProgramFiles\Tailscale\tailscale.exe' up --authkey=$authKey --hostname=$host --accept-routes --accept-dns 2>&1 | Out-File -Append C:\rdp_status.log
+    Start-Sleep -Seconds 5
+    try {
+      $ip = & '$env:ProgramFiles\Tailscale\tailscale.exe' ip -4
+      Add-Content -Path C:\rdp_status.log -Value ""[$(Get-Date -Format o)] - TAILSCALE IP: $ip""
+    } catch {}
+  } else {
+    Add-Content -Path C:\rdp_status.log -Value ""[$(Get-Date -Format o)] - Tailscale not installed""
+  }
+
+} catch {
+  Add-Content -Path C:\rdp_status.log -Value ""[$(Get-Date -Format o)] - ERROR in re-enable script: $_""
+}
+"@
+          $content | Out-File -FilePath $scriptPath -Encoding UTF8 -Force
+          schtasks /Create /TN "ReEnableRDP_Tailscale" /TR "powershell.exe -ExecutionPolicy Bypass -File `"$scriptPath`"" /SC ONSTART /RL HIGHEST /F
+          Write-Host "Created boot re-enable script and scheduled task."
+
+      - name: Write RDP + Tailscale info to file (uses runneradmin and its password if available)
+        shell: pwsh
+        run: |
+          $out = "$env:GITHUB_WORKSPACE/rdp_info.txt"
+          $user = "runneradmin"
+          $pw = $env:RUNNERADMIN_PASS
+          $ip = $env:TAILSCALE_IP
+          if (-not $ip) { 
+            try { $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4; $ip = $ip.Trim() } catch { $ip = "UNAVAILABLE_YET" }
+          }
+          if (-not $pw -or $pw.Trim() -eq "") {
+            $pw = "(RUNNERADMIN_PASS not available in environment)"
+          }
+          $txt = @"
+RDP INFO - Run ID: $env:GITHUB_RUN_ID
+User: $user
+Password: $pw
+Tailscale IP: $ip
+Timestamp: $(Get-Date -Format o)
+"@
+          $txt | Out-File -FilePath $out -Encoding UTF8 -Force
+          Write-Host "RDP info written to $out"
+          Write-Host "==== RDP ACCESS ===="
+          Write-Host "User: $user"
+          Write-Host "Password: $pw"
+          Write-Host "Tailscale IP: $ip"
+          Write-Host "====================="
+
+      - name: Upload rdp-info artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-info
+          path: rdp_info.txt
+
+      - name: Monitor loop (RDP + Tailscale) - up to 72h
+        shell: pwsh
+        run: |
+          Write-Host "=== STARTING MONITOR LOOP (will run until job timeout 72h) ==="
+          $end = (Get-Date).AddHours(72)
+          while ((Get-Date) -lt $end) {
+            try {
+              $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+              $tsStatus = "Not installed"
+              if (Test-Path $tailscaleExe) {
+                try {
+                  $tsIp = & $tailscaleExe ip -4
+                  $tsIp = $tsIp.Trim()
+                  $tsStatus = "UP ($tsIp)"
+                } catch {
+                  $tsStatus = "Installed (no IP yet)"
+                }
+              }
+              $rdpSvc = Get-Service -Name TermService -ErrorAction SilentlyContinue
+              $rdpStatus = if ($rdpSvc) { $rdpSvc.Status } else { "Missing" }
+
+              if ($rdpStatus -eq "Stopped") {
+                Write-Host "⚠️ RDP Stopped -> trying to Start-Service..."
+                try {
+                  Start-Service -Name TermService -ErrorAction Stop
+                  Write-Host "♻️ RDP Service restarted"
+                } catch {
+                  Write-Host "❌ Failed to restart RDP service -> forcing reboot"
+                  Restart-Computer -Force
+                }
+              }
+
+              if (($tsStatus -like "Installed*") -or ($tsStatus -like "Not installed")) {
+                if ($env:TAILSCALE_AUTH_KEY -and (Test-Path $tailscaleExe)) {
+                  Write-Host "🔁 Attempting tailscale up..."
+                  & $tailscaleExe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname="gh-server-$env:GITHUB_RUN_ID" --accept-routes --accept-dns 2>&1 | ForEach-Object { Write-Host $_ }
+                }
+              }
+
+              Write-Host "=== STATUS ==="
+              Write-Host "RDP Service: $rdpStatus"
+              Write-Host "Tailscale: $tsStatus"
+              try { $liveIp = if (Test-Path $tailscaleExe) { (& $tailscaleExe ip -4).Trim() } else { "N/A" } } catch { $liveIp = "N/A" }
+              Write-Host "Tailscale IP (live): $liveIp"
+              Write-Host "Time: $(Get-Date -Format o)"
+              Write-Host "==============="
+            } catch {
+              Write-Host "Monitor loop error: $_"
+            }
+            Start-Sleep -Seconds 30
+          }
+          Write-Host "Monitor loop ended (72h or job timeout)."
+
+      - name: Collect status log artifact
+        if: always()
+        shell: pwsh
+        run: |
+          $statusFile = "C:\rdp_status.log"
+          if (Test-Path $statusFile) { Copy-Item $statusFile -Destination $env:GITHUB_WORKSPACE -Force }
+          else { Write-Host "No C:\rdp_status.log found yet." }
+
+      - name: Upload status log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-status-log
+          path: |
+            rdp_status.log
+            C:\rdp_status.log
+            
