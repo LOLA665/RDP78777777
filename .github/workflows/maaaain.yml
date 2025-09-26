@@ -1,0 +1,104 @@
+name: Configure Tesla T4 vGPU Hyper-V VM
+
+on:
+  workflow_dispatch:
+
+jobs:
+  configure-vgpu:
+    runs-on: windows-2022
+    steps:
+      - name: Check for Tesla T4 GPU presence
+        shell: pwsh
+        run: |
+          $gpu = Get-PnpDevice -FriendlyName "*Tesla T4*" -Status OK
+          if (-not $gpu) {
+            Write-Host "Tesla T4 GPU not found on this host. Aborting."
+            exit 1
+          } else {
+            Write-Host "Found Tesla T4 GPU: $($gpu.FriendlyName)"
+          }
+
+      - name: List partitionable GPUs on host
+        shell: pwsh
+        run: |
+          Get-VMHostPartitionableGpu | Format-Table Name,ValidPartitionCounts,PartitionCount
+
+      - name: Set partition count to 4 for Tesla T4
+        shell: pwsh
+        run: |
+          $gpuName = (Get-VMHostPartitionableGpu | Where-Object { $_.Name -like "*Tesla T4*" }).Name
+          if ($gpuName) {
+            Set-VMHostPartitionableGpu -Name $gpuName -PartitionCount 4
+            Write-Host "Set GPU partition count to 4 for $gpuName"
+          } else {
+            Write-Host "Partitionable Tesla T4 GPU not found."
+            exit 1
+          }
+
+      - name: Add GPU partition adapter to VM
+        shell: pwsh
+        env:
+          VM_NAME: "MyGamingVM"
+        run: |
+          $vm = $env:VM_NAME
+          if (-not (Get-VM -Name $vm -ErrorAction SilentlyContinue)) {
+            Write-Host "VM '$vm' does not exist on this host."
+            exit 1
+          }
+          Get-VMGpuPartitionAdapter -VMName $vm -ErrorAction SilentlyContinue | Remove-VMGpuPartitionAdapter -VMName $vm -Force -ErrorAction SilentlyContinue
+          Add-VMGpuPartitionAdapter -VMName $vm
+          Write-Host "Added GPU partition adapter to VM '$vm'"
+
+      - name: Verify GPU assigned to VM
+        shell: pwsh
+        env:
+          VM_NAME: "MyGamingVM"
+        run: |
+          Get-VMGpuPartitionAdapter -VMName $env:VM_NAME | Format-List *
+
+      - name: Enable Remote Desktop and configure firewall
+        shell: pwsh
+        run: |
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Install and configure Tailscale VPN
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-server-$env:GITHUB_RUN_ID
+
+      - name: Output connection details and GPU info
+        shell: pwsh
+        run: |
+          $gpuInfo = Get-PnpDevice -FriendlyName "*Tesla T4*"
+          $vm = "MyGamingVM"
+          $gpuAdapter = Get-VMGpuPartitionAdapter -VMName $vm
+
+          Write-Host "=== GPU and VM Status ==="
+          Write-Host "Tesla T4 GPU devices found:"
+          $gpuInfo | ForEach-Object { Write-Host " - $($_.FriendlyName) (Status: $($_.Status))" }
+          Write-Host "GPU Partition Adapter assigned to VM '$vm':"
+          $gpuAdapter | Format-List *
+
+          try {
+            $tsIp = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Write-Host "Tailscale IP: $tsIp"
+          }
+          catch {
+            Write-Host "Tailscale IP: Not available"
+          }
+
+      - name: Maintain connection alive (72 hours)
+        shell: pwsh
+        run: |
+          for ($i = 0; $i -lt 432; $i++) {
+            Write-Host ("Maintaining connection... Iteration {0}/432 at {1}" -f $i, (Get-Date))
+            Start-Sleep -Seconds 600
+          }
+          
