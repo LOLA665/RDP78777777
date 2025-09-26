@@ -1,0 +1,139 @@
+name: Windows Runner + RustDesk (report Intel UHD Graphics)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rustdesk-intel-gpu:
+    runs-on: windows-2022
+    timeout-minutes: 360  # 6h
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show runner hardware summary
+        run: |
+          Write-Output "=== RUNNER SYSTEM SUMMARY ==="
+          Write-Output "Time (UTC): $(Get-Date).ToUniversalTime()"
+          Write-Output "OS:"
+          systeminfo | Select-Object -First 10 | ForEach-Object { Write-Output $_ }
+          Write-Output "CPU:"
+          Get-CimInstance -ClassName Win32_Processor | ForEach-Object { Write-Output ("Name: " + $_.Name) ; Write-Output ("Cores: " + $_.NumberOfCores) ; Write-Output ("LogicalProcessors: " + $_.NumberOfLogicalProcessors) }
+          Write-Output "Memory (MB):"
+          Get-CimInstance -ClassName Win32_ComputerSystem | ForEach-Object { Write-Output ("TotalPhysicalMemoryMB: " + ([int]($_.TotalPhysicalMemory / 1MB))) }
+          Write-Output "Disk free space (C:):"
+          Get-PSDrive -Name C | ForEach-Object { Write-Output ("Free: " + ([math]::Round($_.Free/1GB,2)) + " GB  - Used: " + ([math]::Round(($_.Used)/1GB,2)) + " GB") }
+          Write-Output "Detecting video controller(s):"
+          $video = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue
+          if ($video) {
+            $video | ForEach-Object { Write-Output ("Video name: " + $_.Name) ; Write-Output ("DriverVersion: " + $_.DriverVersion) ; Write-Output ("AdapterRAM(MB): " + ([int]($_.AdapterRAM / 1MB))) }
+          } else {
+            Write-Output "No video controller detected via WMI."
+          }
+          Write-Output "=============================="
+
+      - name: Install RustDesk
+        run: |
+          Write-Output "Downloading RustDesk..."
+          $url = "https://github.com/rustdesk/rustdesk/releases/latest/download/rustdesk-1.2.0-windows-x86_64.zip"
+          $zip = "$env:TEMP\rustdesk.zip"
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop
+            Expand-Archive -LiteralPath $zip -DestinationPath "C:\RustDesk" -Force
+            Write-Output "RustDesk downloaded and extracted."
+          } catch {
+            Write-Output "RustDesk download failed: $($_.Exception.Message)"
+          }
+
+          # Start RustDesk in background
+          $exe = Get-ChildItem "C:\RustDesk" -Filter "rustdesk*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($exe) {
+            Start-Process $exe.FullName -ArgumentList "--tray" -WindowStyle Hidden
+            Write-Output "RustDesk started."
+          } else {
+            Write-Output "RustDesk executable not found after extraction."
+          }
+
+      - name: Wait and get RustDesk ID
+        id: rust
+        run: |
+          Start-Sleep -Seconds 15
+          $possible = @(
+            "$env:APPDATA\rustdesk\id",
+            "$env:APPDATA\RustDesk\id",
+            "$env:LOCALAPPDATA\RustDesk\id"
+          )
+          $id = $null
+          foreach ($p in $possible) {
+            if (Test-Path $p) {
+              try {
+                $id = Get-Content $p -Raw
+                break
+              } catch {}
+            }
+          }
+          # fallback: try to inspect any 'id' file under AppData quickly
+          if (-not $id) {
+            try {
+              $found = Get-ChildItem -Path $env:APPDATA -Recurse -Filter "id" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) { $id = Get-Content $found.FullName -Raw }
+            } catch {}
+          }
+          if (-not $id) { $id = "NOT_FOUND" }
+          # write outputs
+          Write-Output "rustdesk_id=$id" >> $env:GITHUB_OUTPUT
+          Write-Output "RustDesk ID detected: $id"
+
+      - name: Generate RustDesk password
+        id: pass
+        run: |
+          $pass = -join ((33..126) | Get-Random -Count 12 | ForEach-Object {[char]$_})
+          Write-Output "rustdesk_password=$pass" >> $env:GITHUB_OUTPUT
+          Write-Output "Generated RustDesk password (for access via client if needed)."
+
+      - name: Ensure GPU reported as Intel UHD Graphics (or fallback)
+        id: gpu_check
+        run: |
+          $video = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue
+          if ($video) {
+            $names = $video | ForEach-Object { $_.Name } | Where-Object { $_ -ne $null } | ForEach-Object { $_.Trim() } 
+            if ($names -match "Intel") {
+              $gpu_name = ($names -join "; ")
+            } else {
+              # If Intel not present, still prefer to show Intel UHD as user requested
+              $gpu_name = "Intel(R) UHD Graphics"
+            }
+          } else {
+            $gpu_name = "Intel(R) UHD Graphics"
+          }
+          Write-Output "gpu_name=$gpu_name" >> $env:GITHUB_OUTPUT
+          Write-Output "Reported GPU: $gpu_name"
+
+      - name: Save connection info to files
+        run: |
+          $id = "${{ steps.rust.outputs.rustdesk_id }}"
+          if (-not $id) { $id = "NOT_FOUND" }
+          $pass = "${{ steps.pass.outputs.rustdesk_password }}"
+          Set-Content -Path "$env:GITHUB_WORKSPACE\rustdesk_id.txt" -Value $id -Force
+          Set-Content -Path "$env:GITHUB_WORKSPACE\rustdesk_pass.txt" -Value $pass -Force
+          Set-Content -Path "$env:GITHUB_WORKSPACE/gpu_name.txt" -Value "${{ steps.gpu_check.outputs.gpu_name }}" -Force
+          Write-Output "Saved rustdesk_id.txt, rustdesk_pass.txt, gpu_name.txt in workspace."
+
+      - name: Show final details in logs
+        run: |
+          Write-Output "=== CONNECTION INFO ==="
+          Write-Output ("RustDesk ID   : " + "${{ steps.rust.outputs.rustdesk_id }}")
+          Write-Output ("RustDesk Pass : " + "${{ steps.pass.outputs.rustdesk_password }}")
+          Write-Output ("GPU Reported  : " + "${{ steps.gpu_check.outputs.gpu_name }}")
+          # Show quick system snapshot again
+          Get-CimInstance -ClassName Win32_VideoController | ForEach-Object { Write-Output ("Detected video controller: " + $_.Name) }
+          Get-CimInstance -ClassName Win32_Processor | ForEach-Object { Write-Output ("Processor: " + $_.Name) }
+          Get-CimInstance -ClassName Win32_ComputerSystem | ForEach-Object { Write-Output ("TotalPhysicalMemoryMB: " + ([int]($_.TotalPhysicalMemory / 1MB))) }
+          Write-Output "======================="
+
+      - name: Keep workflow alive (up to 6h)
+        run: |
+          Write-Output "Keeping runner alive for up to 6 hours. Cancel workflow manually to stop earlier."
+          Start-Sleep -Seconds 21600
+          
