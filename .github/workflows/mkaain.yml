@@ -1,0 +1,223 @@
+name: RDP Gaming Server Windows (My Summer Car Extra Impossible Mode + Ryzen7 Spoof)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp-gaming:
+    runs-on: windows-2022
+    timeout-minutes: 4320  # 72 ore
+
+    steps:
+      - name: Windows + CPU (Ryzen7 spoof) + Extra Impossible Mode WARP
+        shell: pwsh
+        run: |
+          Write-Host "=== START: Ryzen7 spoof + Extra Impossible Mode WARP tweaks ==="
+
+          # --- CPU spoof (registry) - face sistemul sa "arate" ca Ryzen 7 5800X ---
+          reg add "HKLM\Hardware\Description\System\CentralProcessor\0" /v "ProcessorNameString" /t REG_SZ /d "AMD Ryzen 7 5800X" /f
+          reg add "HKLM\Hardware\Description\System\CentralProcessor\0" /v "~MHz" /t REG_DWORD /d 3800 /f
+          # (notă: aceasta este o emulare software a identificatorului CPU; nu modifică performanta reala, doar ce raporteaza sistemul)
+
+          # --- WARP / Fake GPU setup ---
+          reg add "HKCU\Software\Microsoft\Direct3D" /v "ForceWarp" /t REG_DWORD /d 1 /f
+          reg add "HKLM\Software\FakeGPU" /v "Name" /t REG_SZ /d "NVIDIA GeForce RTX 3060" /f
+          reg add "HKLM\Software\FakeGPU" /v "VRAM_MB" /t REG_DWORD /d 16384 /f
+          reg add "HKLM\Software\FakeGPU" /v "Bandwidth_MBps" /t REG_DWORD /d 500000 /f
+          reg add "HKLM\Software\FakeGPU" /v "DriverVersion" /t REG_SZ /d "546.33" /f
+          reg add "HKLM\Software\FakeGPU" /v "CUDA" /t REG_SZ /d "8.6" /f
+          reg add "HKLM\Software\FakeGPU" /v "RayTracing" /t REG_SZ /d "Supported" /f
+
+          # --- Power plan + timer tweaks ---
+          powercfg /setactive SCHEME_MIN
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Kernel" /v "GlobalTimerResolutionRequests" /t REG_DWORD /d 1 /f
+
+          # --- WARP ultra registry tweaks (Extra Impossible Mode) ---
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "ThreadCount" /t REG_DWORD /d 128 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "MaxConcurrency" /t REG_DWORD /d 64 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "UseHighPrecision" /t REG_DWORD /d 1 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "EnableCommandLists" /t REG_DWORD /d 1 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "EnableAdaptiveCommandLists" /t REG_DWORD /d 1 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "EnableMaxPerformanceMode" /t REG_DWORD /d 1 /f
+          reg add "HKCU\Software\Microsoft\Direct3D\WARP" /v "DisableDebugLayers" /t REG_DWORD /d 1 /f
+
+          # --- Stop serviciile inutile (ignoreaza erorile daca nu exista) ---
+          $stopList = "DiagTrack","WSearch","SysMain","MapsBroker","PrintNotify","Spooler"
+          foreach ($s in $stopList) {
+            if (Get-Service -Name $s -ErrorAction SilentlyContinue) {
+              try { Stop-Service -Name $s -Force -ErrorAction SilentlyContinue } catch {}
+            }
+          }
+
+          # --- Maximize CPU usage for processes: set current process to Realtime and set full affinity ---
+          try {
+            $proc = Get-Process -Id $PID
+            $proc.PriorityClass = "Realtime"
+            $logical = (Get-CimInstance -ClassName Win32_ComputerSystem).NumberOfLogicalProcessors
+            if ($logical -and $logical -gt 0) {
+              # build affinity mask: (2^logical) - 1
+              $mask = [int64](([math]::Pow(2, [int]$logical) - 1))
+              $proc.ProcessorAffinity = $mask
+              Write-Host "Set process priority Realtime and affinity mask $mask (logical cores: $logical)."
+            }
+          } catch {
+            Write-Host "Warning: could not set Realtime priority/affinity: $_"
+          }
+
+          Write-Host "=== Ryzen7 spoof + Extra Impossible Mode applied ==="
+
+      - name: Activeaza Remote Desktop
+        shell: pwsh
+        run: |
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: RevealOrResetRunneradmin (afișează sau resetează runneradmin)
+        shell: pwsh
+        env:
+          runneradmin_PASS: ${{ secrets.RUNNERADMIN_PASS || '' }}
+        run: |
+          Add-Type -AssemblyName System.Security
+          function GenPass { -join ((33..126) | Get-Random -Count 16 | % {[char]$_}) }
+          $user = "runneradmin"
+          $existingUser = Get-LocalUser -Name $user -ErrorAction SilentlyContinue
+
+          if (-not $existingUser) {
+            Write-Host "User '$user' nu exista pe sistem. Nu vom modifica nimic."
+            exit 0
+          }
+
+          if ($env:runneradmin_PASS -and $env:runneradmin_PASS.Trim().Length -gt 0) {
+            Write-Host "Runneradmin parola gasita in mediu. Nu se reseteaza."
+            Write-Output "RUNNERADMIN_USER=$user" >> $env:GITHUB_ENV
+            Write-Output "RUNNERADMIN_PASS=$env:runneradmin_PASS" >> $env:GITHUB_ENV
+            exit 0
+          }
+
+          $newPass = GenPass
+          $secure = ConvertTo-SecureString $newPass -AsPlainText -Force
+          try {
+            Set-LocalUser -Name $user -Password $secure -ErrorAction Stop
+            Write-Host "Parola pentru '$user' a fost resetata si exportata in GITHUB_ENV."
+            Write-Output "RUNNERADMIN_USER=$user" >> $env:GITHUB_ENV
+            Write-Output "RUNNERADMIN_PASS=$newPass" >> $env:GITHUB_ENV
+          } catch {
+            Write-Host "Eroare la resetarea parolei pentru '$user': $_"
+            exit 1
+          }
+
+      - name: Set desktop refresh rate to 60Hz (try)
+        shell: pwsh
+        run: |
+          Write-Host "Attempting to set primary display refresh rate to 60Hz..."
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public class Disp {
+            [StructLayout(LayoutKind.Sequential)]
+            public struct DEVMODE {
+              [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmDeviceName;
+              public short dmSpecVersion;
+              public short dmDriverVersion;
+              public short dmSize;
+              public short dmDriverExtra;
+              public int dmFields;
+              public int dmPositionX;
+              public int dmPositionY;
+              public int dmDisplayOrientation;
+              public int dmDisplayFixedOutput;
+              public int dmColor;
+              public int dmDuplex;
+              public int dmYResolution;
+              public int dmTTOption;
+              public int dmCollate;
+              [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmFormName;
+              public short dmLogPixels;
+              public int dmBitsPerPel;
+              public int dmPelsWidth;
+              public int dmPelsHeight;
+              public int dmDisplayFlags;
+              public int dmDisplayFrequency;
+              public int dmICMMethod;
+              public int dmICMIntent;
+              public int dmMediaType;
+              public int dmDitherType;
+              public int dmReserved1;
+              public int dmReserved2;
+              public int dmPanningWidth;
+              public int dmPanningHeight;
+            }
+            [DllImport("user32.dll")]
+            public static extern int EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE devMode);
+            [DllImport("user32.dll")]
+            public static extern int ChangeDisplaySettings(ref DEVMODE devMode, int flags);
+          }
+"@
+
+          $devmode = New-Object Disp+DEVMODE
+          $DM_PELSWIDTH = 0x80000
+          [void][Disp]::EnumDisplaySettings($null, -1, [ref]$devmode)
+          $devmode.dmDisplayFrequency = 60
+          $res = [Disp]::ChangeDisplaySettings([ref]$devmode, 0)
+          Write-Host "ChangeDisplaySettings result: $res (0 = success, 1 = restart required, other = failure)"
+
+      - name: Instaleaza si configureaza Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-server-$env:GITHUB_RUN_ID
+
+      - name: Afiseaza toate datele de conectare (user + parola + IP) - final
+        shell: pwsh
+        run: |
+          $runnerUser = $env:RUNNERADMIN_USER
+          $runnerPass = $env:RUNNERADMIN_PASS
+          $mscUser = $env:MSC_USER
+          $mscPass = $env:MSC_PASS
+
+          if (-not $mscUser -or $mscUser.Trim() -eq "") {
+            $lu = Get-LocalUser -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*MSC*" } | Select-Object -First 1
+            if ($lu) { $mscUser = $lu.Name }
+          }
+
+          $tsIp = ""
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+            try { $tsIp = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4; $tsIp = $tsIp.Trim() } catch {}
+          }
+
+          Write-Host "=== INFORMATII ACCES RDP ==="
+          if ($mscUser) {
+            if ($mscPass) {
+              Write-Host "User local: $mscUser  / Parola: $mscPass"
+            } else {
+              Write-Host "User local: $mscUser  / Parola: (necunoscuta sau neschimbata)"
+            }
+          } else {
+            Write-Host "User local (MSC) : NU a fost gasit in mediu."
+          }
+
+          if ($runnerUser) {
+            Write-Host "User runneradmin: $runnerUser  / Parola: $runnerPass"
+          } else {
+            Write-Host "User runneradmin: NU a fost exportat (s-ar fi putut produce eroare anterior)."
+          }
+
+          if ($tsIp) { Write-Host "IP Tailscale: $tsIp" } else { Write-Host "IP Tailscale: (nevalabil)" }
+          Write-Host "CPU reported as: AMD Ryzen 7 5800X (registry spoof)"
+          Write-Host "GPU Fake: NVIDIA GeForce RTX 3060 (WARP Extra Impossible Mode)"
+          Write-Host "Timeout job: 72 hours (timeout-minutes: 4320)"
+          Write-Host "============================"
+
+      - name: Maintaining Connection (ping every 10 min) - fixed loop
+        shell: pwsh
+        run: |
+          for ($i = 0; $i -lt 432; $i++) {
+            Write-Host ("Maintaining Connection... Iteration {0} / 432 - {1}" -f $i, (Get-Date))
+            Start-Sleep -Seconds 600
+          }
+          
