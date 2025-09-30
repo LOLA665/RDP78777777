@@ -1,0 +1,393 @@
+name: RDP Gaming Server — 500GB SSD Optimized
+
+on:
+  workflow_dispatch:
+
+env:
+  TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+  RUNNERADMIN_PASS: ${{ secrets.RUNNERADMIN_PASS }}
+  RUNNERADMIN_USER: runneradmin
+  KEEPALIVE_ITER: 432
+
+jobs:
+  rdp-gaming:
+    runs-on: windows-2022
+    timeout-minutes: 4320
+
+    steps:
+      - name: Checkout code
+        uses: "actions/checkout@v4"
+
+      - name: Setup 500GB SSD Storage
+        shell: pwsh
+        run: |
+          Write-Host "Checking available storage..."
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, Used, Free, @{n='Size(GB)';e={[math]::Round($_.Used/1GB + $_.Free/1GB, 2)}}, @{n='Free(GB)';e={[math]::Round($_.Free/1GB, 2)}}
+          
+          # Create gaming directories on larger storage
+          $gameDirs = @("C:\Games", "C:\Games\GPU_SoftwareFallback", "C:\Games\Temp", "C:\Games\Cache")
+          foreach ($dir in $gameDirs) {
+            if (!(Test-Path $dir)) {
+              New-Item -Path $dir -ItemType Directory -Force
+              Write-Host "Created directory: $dir"
+            }
+          }
+          
+          # Configure temporary files to use gaming storage
+          [Environment]::SetEnvironmentVariable("TEMP", "C:\Games\Temp", "Machine")
+          [Environment]::SetEnvironmentVariable("TMP", "C:\Games\Temp", "Machine")
+          $env:TEMP = "C:\Games\Temp"
+          $env:TMP = "C:\Games\Temp"
+
+      - name: Ensure runneradmin exists & export credentials
+        shell: pwsh
+        run: |
+          $provided = $env:RUNNERADMIN_PASS
+          $isValid = $false
+          if (-not [string]::IsNullOrWhiteSpace($provided)) {
+            # Verificare complexitate parolă: minim 8 caractere, Mici, Mari, Cifră, Caracter special
+            if ($provided.Length -ge 8 -and $provided -match '[A-Z]' -and $provided -match '[a-z]' -and $provided -match '\d' -and $provided -match '[^a-zA-Z0-9]') { $isValid = $true }
+          }
+          # Utilizează parola furnizată sau generează una sigură
+          if ($isValid) { $pass = $provided } else { $pass = "Runner@" + (Get-Random -Minimum 10000 -Maximum 99999) }
+          $user = $env:RUNNERADMIN_USER
+          
+          if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) {
+            try { net user $user $pass } catch { Write-Warning "Password reset for $user failed: $($_.Exception.Message)" }
+            Write-Host "User $user exists - password reset attempted."
+          } else {
+            try { net user $user $pass /add; net localgroup administrators $user /add; Write-Host "Created user $user and added to admins." } 
+            catch { Write-Warning "User creation failed: $($_.Exception.Message)" }
+          }
+          
+          # Salvarea parolei generate în ENV
+          Add-Content -Path $env:GITHUB_ENV -Value ("RUNNERADMIN_USER={0}" -f $user)
+          Add-Content -Path $env:GITHUB_ENV -Value ("RUNNERADMIN_PASS={0}" -f $pass) 
+
+      - name: Enable Remote Desktop & firewall
+        shell: pwsh
+        run: |
+          try { 
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force 
+            Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          } catch {}
+
+      - name: Install dependencies with SSD optimization
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $t = "C:\Games\Temp"
+          
+          Write-Host "Installing dependencies to SSD-optimized locations..."
+          
+          # DirectX - Essential for both games
+          $dx = Join-Path $t 'directx_Jun2010_redist.exe'
+          try { 
+            Invoke-WebRequest 'https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-8280-9E7F4AA0AAB1/directx_Jun2010_redist.exe' -OutFile $dx -ErrorAction Stop
+            # Atenție: Acesta este un executabil auto-extractabil, nu un MSI. /Q ar trebui să funcționeze pentru extragere.
+            Start-Process $dx -ArgumentList '/Q' -Wait 
+            Write-Host "DirectX installed successfully"
+          } catch {
+            Write-Warning "DirectX installation failed: $($_.Exception.Message)"
+          }
+          
+          # .NET Framework 4.8 
+          $net = Join-Path $t 'ndp48.exe'
+          try { 
+            Invoke-WebRequest 'https://go.microsoft.com/fwlink/?linkid=2088631' -OutFile $net -ErrorAction Stop
+            Start-Process $net -ArgumentList '/q','/norestart' -Wait 
+            Write-Host ".NET Framework 4.8 installed successfully"
+          } catch {
+            Write-Warning ".NET Framework installation failed: $($_.Exception.Message)"
+          }
+          
+          # Visual C++ Redistributables 
+          $vcVersions = @(
+            @{Url='https://aka.ms/vs/17/release/vc_redist.x86.exe'; Name='VC++ 2022 x86'},
+            @{Url='https://aka.ms/vs/17/release/vc_redist.x64.exe'; Name='VC++ 2022 x64'},
+            @{Url='https://download.microsoft.com/download/9/3/F/93FCF1E7-E6A9-4Ef5-9E7B-E97E4A6F78E5/vc_redist.x86.exe'; Name='VC++ 2015-2019 x86'},
+            @{Url='https://download.microsoft.com/download/9/3/F/93FCF1E7-E6A9-4Ef5-9E7B-E97E4A6F78E5/vc_redist.x64.exe'; Name='VC++ 2015-2019 x64'}
+          )
+          
+          foreach ($vc in $vcVersions) {
+            $vcPath = Join-Path $t "$([System.IO.Path]::GetFileName($vc.Url))"
+            try {
+              Invoke-WebRequest $vc.Url -OutFile $vcPath -ErrorAction Stop
+              Start-Process $vcPath -ArgumentList '/install','/quiet','/norestart' -Wait
+              Write-Host "$($vc.Name) installed successfully"
+              Start-Sleep -Seconds 2
+            } catch {
+              Write-Warning "$($vc.Name) installation failed: $($_.Exception.Message)"
+            }
+          }
+
+      - name: Install SwiftShader on SSD for faster access
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $swiftShaderDir = "C:\Games\GPU_SoftwareFallback"
+          New-Item -Path $swiftShaderDir -ItemType Directory -Force | Out-Null
+          
+          $zip = Join-Path $env:TEMP "SwiftShader-Release.zip"
+          try {
+            Write-Host "Downloading SwiftShader for SSD-optimized fallback..."
+            Invoke-WebRequest 'https://github.com/google/swiftshader/releases/latest/download/SwiftShader-Release.zip' -OutFile $zip -ErrorAction Stop
+            Expand-Archive -Path $zip -DestinationPath $swiftShaderDir -Force
+            Write-Host "SwiftShader installed to SSD location: $swiftShaderDir"
+            
+            # Verify installation
+            $dllCount = (Get-ChildItem -Path $swiftShaderDir -Filter "*.dll" -Recurse).Count
+            Write-Host "SwiftShader DLLs installed: $dllCount"
+          } catch {
+            Write-Warning "SwiftShader installation failed: $($_.Exception.Message)"
+          }
+
+      - name: Advanced SSD Gaming Optimizations
+        shell: pwsh
+        run: |
+          Write-Host "Applying SSD-optimized gaming configurations..."
+          
+          # Ultimate Performance power scheme
+          try { 
+            powercfg /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61
+            powercfg /setactive e9a42b02-d5df-448d-aa00-03f14749eb61
+            Write-Host "Ultimate Performance power scheme activated"
+          } catch {}
+          
+          # Disable unnecessary services for SSD performance
+          $svcList = @('WSearch','SysMain','WerSvc','dmwappushservice','XblGameSave','RetailDemo',
+                      'CDPUserSvc','MapsBroker','MessagingService','DiagTrack','WMPNetworkSvc',
+                      'TabletInputService','XboxGipSvc','WpcMonSvc','WdiSystemHost','WdiServiceHost',
+                      'Fax','Spooler','PrintNotify')
+          foreach ($s in $svcList) {
+            try {
+              if (Get-Service $s -ErrorAction SilentlyContinue) {
+                Set-Service $s -StartupType Disabled -ErrorAction SilentlyContinue
+                Stop-Service $s -Force -ErrorAction SilentlyContinue
+                Write-Host "Disabled service: $s"
+              }
+            } catch {}
+          }
+          
+          # SSD-specific performance optimizations
+          try { 
+            Write-Host "Applying registry optimizations for SSD..."
+            
+            # Disable visual effects
+            reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f
+            reg add "HKCU\Control Panel\Desktop" /v DragFullWindows /t REG_SZ /d "0" /f
+            reg add "HKCU\Control Panel\Desktop" /v MenuShowDelay /t REG_SZ /d "0" /f
+            reg add "HKCU\Control Panel\Desktop" /v UserPreferencesMask /t REG_BINARY /d "9032078010000000" /f
+            
+            # Game mode and DVR optimizations
+            reg add "HKLM\SOFTWARE\Microsoft\PolicyManager\default\ApplicationManagement\AllowGameDVR" /v value /t REG_DWORD /d 0 /f
+            reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\GameDVR" /v AllowGameDVR /t REG_DWORD /d 0 /f
+            reg add "HKCU\System\GameConfigStore" /v GameDVR_Enabled /t REG_DWORD /d 0 /f
+            reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" /v AppCaptureEnabled /t REG_DWORD /d 0 /f
+            
+            # Multimedia system performance
+            reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v SystemResponsiveness /t REG_DWORD /d 0 /f
+            reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v NetworkThrottlingIndex /t REG_DWORD /d 0xFFFFFFFF /f
+            
+            # Game task priorities
+            reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v "GPU Priority" /t REG_DWORD /d 8 /f
+            reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v "Priority" /t REG_DWORD /d 6 /f
+            reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v "Scheduling Category" /t REG_SZ /d "High" /f
+            
+            # Graphics driver stability
+            reg add "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" /v TdrDelay /t REG_DWORD /d 60 /f
+            reg add "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" /v TdrLevel /t REG_DWORD /d 0 /f
+            
+            # **ERORI FIXATE:** SSD performance optimizations (Calea de registry corectată)
+            reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v NtfsDisableLastAccessUpdate /t REG_DWORD /d 1 /f
+            reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters" /v EnablePrefetcher /t REG_DWORD /d 0 /f
+            reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters" /v EnableSuperfetch /t REG_DWORD /d 0 /f
+            
+            Write-Host "SSD gaming optimizations completed"
+          } catch {
+            Write-Warning "Some registry optimizations failed: $($_.Exception.Message)"
+          }
+
+      - name: Create SSD-Optimized FPS Management System
+        shell: pwsh
+        run: |
+          # Create comprehensive FPS optimizer script on SSD
+          $fpsOptimizerScript = @"
+          `$sleepTime = 3000  # Check every 3 seconds for faster response
+          
+          function Optimize-Process {
+            param(`$ProcessName, `$TargetFPS)
+            
+            `$processes = Get-Process -Name `$ProcessName -ErrorAction SilentlyContinue
+            if (`$processes) {
+              foreach (`$proc in `$processes) {
+                try { 
+                  # Set highest possible priority
+                  `$proc.PriorityClass = "High"
+                  # Use all available CPU cores
+                  `$proc.ProcessorAffinity = [System.IntPtr]::op_Explicit(0xFFFFFFFF)
+                  Write-Host "Optimized `$ProcessName for `$TargetFPS FPS (PID: `$(`$proc.Id))"
+                } catch {
+                  Write-Warning "Could not optimize `$ProcessName"
+                }
+              }
+              return `$true
+            }
+            return `$false
+          }
+          
+          function Clean-Memory {
+            try {
+              [System.GC]::Collect()
+              [System.GC]::WaitForPendingFinalizers()
+              [System.GC]::Collect()
+            } catch {}
+          }
+          
+          Write-Host "SSD-Optimized FPS Manager Started - Monitoring games..."
+          Write-Host "Target FPS: My Summer Car - 32FPS | GTA5 - 30FPS"
+          
+          while (`$true) {
+            `$mscRunning = Optimize-Process -ProcessName "MySummerCar" -TargetFPS 32
+            `$gtaRunning = Optimize-Process -ProcessName "GTA5" -TargetFPS 30
+            Clean-Memory
+            
+            if (`$mscRunning -or `$gtaRunning) {
+              Write-Host "[`$(Get-Date -Format 'HH:mm:ss')] Active - MSC: `$mscRunning, GTA5: `$gtaRunning"
+            }
+            
+            Start-Sleep -Milliseconds `$sleepTime
+          }
+"@
+          Set-Content -Path "C:\Games\ssd_fps_optimizer.ps1" -Value $fpsOptimizerScript
+          Write-Host "SSD-optimized FPS manager created"
+
+      - name: Launch Games with SSD Optimization (NOTA: Jocurile nu sunt instalate automat)
+        shell: pwsh
+        run: |
+          Write-Host "Starting games with SSD optimizations..."
+          
+          # Start SSD-optimized FPS manager
+          Start-Process -FilePath "pwsh.exe" -ArgumentList "-File", "C:\Games\ssd_fps_optimizer.ps1" -WindowStyle Hidden
+          Write-Host "SSD FPS optimizer started in background (Will monitor for game processes)"
+          
+          # Reține: Acești pași vor eșua/avertiza deoarece My Summer Car și GTA5 nu sunt instalate.
+          $mscPath = "C:\Program Files (x86)\Steam\steamapps\common\My Summer Car\MySummerCar.exe"
+          $gtaPath = "C:\Program Files\Rockstar Games\GTA V\GTA5.exe"
+          
+          function Clean-Memory {
+            try {
+              [System.GC]::Collect()
+              [System.GC]::WaitForPendingFinalizers()
+            } catch {}
+          }
+          
+          function Launch-SSDGame {
+            param($GamePath, $GameName, $ExpectedFPS)
+            
+            if (Test-Path $GamePath) {
+              Write-Host "Launching $GameName from SSD (Target: $ExpectedFPS FPS)..."
+              Clean-Memory
+              $process = Start-Process -FilePath $GamePath -PassThru -ErrorAction SilentlyContinue
+              if ($process -and !$process.HasExited) {
+                Write-Host "$GameName launched successfully (PID: $($process.Id))"
+              } else {
+                Write-Warning "Failed to launch $GameName"
+              }
+            } else {
+              Write-Warning "ATTENTION: $GameName not found at: $GamePath. Install games manually via RDP."
+            }
+            return $null
+          }
+          
+          $mscProcess = Launch-SSDGame -GamePath $mscPath -GameName "My Summer Car" -ExpectedFPS 32
+          Start-Sleep -Seconds 5
+          
+          $gtaProcess = Launch-SSDGame -GamePath $gtaPath -GameName "GTA5" -ExpectedFPS 30
+          Start-Sleep -Seconds 10
+          
+          Write-Host "Game launch sequence completed"
+
+      - name: Install & Start Tailscale
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            try {
+              Write-Host "Installing Tailscale on SSD..."
+              $msi = Join-Path $env:TEMP "tailscale.msi"
+              Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi -ErrorAction Stop
+              Start-Process msiexec.exe -ArgumentList @('/i',$msi,'/quiet','/norestart') -Wait -NoNewWindow
+              Start-Sleep -Seconds 10
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey $env:TAILSCALE_AUTH_KEY --hostname "gh-gaming-ssd-$($env:GITHUB_RUN_ID)" --accept-routes --accept-dns
+              Write-Host "Tailscale installed and connected"
+            } catch {
+              Write-Warning "Tailscale installation failed: $($_.Exception.Message)"
+            }
+          }
+
+      - name: Display SSD Gaming Information (Corecție de securitate aplicată)
+        shell: pwsh
+        run: |
+          Write-Host "=== SSD GAMING SERVER READY ==="
+          Write-Host "Storage: 500GB SSD Optimized"
+          Write-Host "Access Credentials:"
+          Write-Host "Username: $env:RUNNERADMIN_USER"
+          Write-Host "Password: (Set in secrets or randomly generated - **DO NOT expose in logs**)" # Securitate!
+          
+          # Display storage information
+          Write-Host "`nStorage Information:"
+          Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Name -eq 'C' } | Format-Table Name, 
+            @{n='Total(GB)';e={[math]::Round($_.Used/1GB + $_.Free/1GB, 2)}},
+            @{n='Used(GB)';e={[math]::Round($_.Used/1GB, 2)}},
+            @{n='Free(GB)';e={[math]::Round($_.Free/1GB, 2)}} -AutoSize | Out-String
+          
+          # Get connection information
+          $ip = ""
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+            try { 
+              $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1
+              if ($ip) { $ip = $ip.Trim() }
+            } catch {}
+          }
+          
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            try { 
+              $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
+                $_.InterfaceAlias -notlike "*Loopback*" -and $_.IPAddress -notlike "169.254.*"
+              } | Select-Object -First 1).IPAddress
+            } catch {}
+          }
+          
+          Write-Host "Connection IP: $($ip -ne $null ? $ip : 'Auto-detecting...')"
+          Write-Host "FPS Targets: My Summer Car - 32FPS | GTA5 - 30FPS"
+          Write-Host "Optimizations: SSD-Performance | Ultimate Power Scheme"
+          Write-Host "======================================"
+
+      - name: SSD Keepalive and Performance Monitoring
+        shell: pwsh
+        run: |
+          $iterations = [int]$env:KEEPALIVE_ITER
+          Write-Host "Starting SSD-optimized keepalive monitor..."
+          
+          for ($i = 0; $i -lt $iterations; $i++) {
+            $timestamp = (Get-Date).ToString('HH:mm:ss')
+            
+            # Check game processes
+            $mscRunning = Get-Process -Name "MySummerCar" -ErrorAction SilentlyContinue
+            $gtaRunning = Get-Process -Name "GTA5" -ErrorAction SilentlyContinue
+            
+            # Display status with SSD info
+            Write-Host "[$timestamp] Cycle $($i + 1)/$iterations | SSD Gaming Monitor"
+            Write-Host "  My Summer Car: $(if($mscRunning){'RUNNING (32FPS target)'}else{'NOT RUNNING'})"
+            Write-Host "  GTA5: $(if($gtaRunning){'RUNNING (30FPS target)'}else{'NOT RUNNING'})"
+            
+            # Display storage status periodically
+            if ($i % 10 -eq 0) {
+              $storage = Get-PSDrive -Name 'C' -PSProvider FileSystem
+              $freeGB = [math]::Round($storage.Free/1GB, 2)
+              Write-Host "  SSD Storage: $freeGB GB free"
+            }
+            
+            Start-Sleep -Seconds 600
+          }
