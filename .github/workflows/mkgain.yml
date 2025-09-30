@@ -1,0 +1,37 @@
+name: Start Remote AVICA Windows Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      avica_id:
+        description: "Introduceți ID-ul AVICA (Remote PC)"
+        required: true
+        type: string
+      avica_pass:
+        description: "Introduceți Parola AVICA (Remote PC)"
+        required: true
+        type: string
+
+jobs:
+  avica-remote-runner:
+    runs-on: ubuntu-latest
+    env:
+      AVICA_RUNTIME_HOURS: 6
+      AVICA_OS: windows-2025 # sau windows-11
+      AVICA_RAM_GB: 32
+      AVICA_SSD_GB: 600
+    steps:
+      - name: Informații cerințe hardware/software
+        run: |
+          echo "Se va folosi un Remote PC AVICA cu:"
+          echo " - OS: $AVICA_OS"
+          echo " - RAM: $AVICA_RAM_GB GB"
+          echo " - SSD: $AVICA_SSD_GB GB"
+          echo " - Timp de rulare: $AVICA_RUNTIME_HOURS ore"
+      - name: Afișează datele de conectare AVICA
+        run: |
+          echo "ID AVICA: ${{ github.event.inputs.avica_id }}"
+          echo "Parola AVICA: ${{ github.event.inputs.avica_pass }}"
+      - name: Confirmare timp de conexiune
+        run: |
+          echo "Conexiunea cu remote-ul AVICA va fi menținută pentru $AVICA_RUNTIME_HOURS ore."
