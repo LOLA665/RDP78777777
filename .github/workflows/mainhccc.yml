@@ -1,0 +1,69 @@
+name: RustDesk Windows Server 6h Session
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rustdesk-server:
+    runs-on: windows-latest
+    timeout-minutes: 360 # 6 ore
+    steps:
+      - name: Download RustDesk (latest Windows EXE)
+        shell: pwsh
+        run: |
+          Write-Host "Looking for the latest RustDesk Windows .exe asset..."
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/rustdesk/rustdesk/releases/latest"
+          $assets = $release.assets
+          if (-not $assets) {
+            Write-Error "No assets found in latest release!"
+            exit 1
+          }
+          $assets | ForEach-Object { Write-Host $_.name }
+          $asset = $assets | Where-Object { $_.name -match "x86_64\.exe$" } | Select-Object -First 1
+          if (-not $asset) {
+            Write-Error "No Windows .exe asset found in latest release!"
+            exit 1
+          }
+          Write-Host "Found asset: $($asset.name)"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "rustdesk.exe"
+      - name: Start RustDesk (headless)
+        shell: pwsh
+        run: |
+          Write-Host "Starting RustDesk in headless mode..."
+          Start-Process -FilePath ".\rustdesk.exe" -ArgumentList "--headless" -WindowStyle Hidden
+          Start-Sleep -Seconds 15
+      - name: Show RustDesk ID and Password (start)
+        shell: pwsh
+        run: |
+          $idFile = "$env:APPDATA\rustdesk\id"
+          $pwFile = "$env:APPDATA\rustdesk\passwd"
+          if (!(Test-Path $idFile) -or !(Test-Path $pwFile)) {
+            Write-Error "RustDesk has not generated ID or password files!"
+            exit 1
+          }
+          $id = Get-Content $idFile
+          $pw = Get-Content $pwFile
+          Write-Host "============================="
+          Write-Host "RustDesk ID: $id"
+          Write-Host "RustDesk Password: $pw"
+          Write-Host "============================="
+      - name: Keep session alive for 6 hours
+        shell: pwsh
+        run: |
+          Write-Host "Keeping session alive for 6 hours..."
+          Start-Sleep -Seconds 21600 # 6 ore
+      - name: Show RustDesk ID and Password (final)
+        shell: pwsh
+        run: |
+          $idFile = "$env:APPDATA\rustdesk\id"
+          $pwFile = "$env:APPDATA\rustdesk\passwd"
+          if (!(Test-Path $idFile) -or !(Test-Path $pwFile)) {
+            Write-Error "RustDesk has not generated ID or password files!"
+            exit 1
+          }
+          $id = Get-Content $idFile
+          $pw = Get-Content $pwFile
+          Write-Host "============================="
+          Write-Host "RustDesk ID: $id"
+          Write-Host "RustDesk Password: $pw"
+          Write-Host "============================="
