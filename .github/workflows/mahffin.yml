@@ -1,0 +1,43 @@
+name: RustDesk Windows Server 6h Session
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rustdesk-server:
+    runs-on: windows-latest
+    timeout-minutes: 360 # 6 ore
+    steps:
+      - name: Download RustDesk (latest Windows x64)
+        shell: pwsh
+        run: |
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/rustdesk/rustdesk/releases/latest"
+          $asset = $release.assets | Where-Object { $_.name -like "*windows_x64.zip" } | Select-Object -First 1
+          if ($null -eq $asset) { throw "No Windows x64 asset found in latest release!" }
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "rustdesk.zip"
+          Expand-Archive -Path "rustdesk.zip" -DestinationPath "rustdesk"
+      - name: Start RustDesk (headless)
+        run: |
+          cd rustdesk
+          Start-Process -FilePath ".\rustdesk.exe" -ArgumentList "--headless" -WindowStyle Hidden
+          Start-Sleep -Seconds 15
+      - name: Show RustDesk ID and Password (start)
+        run: |
+          $id = Get-Content "$env:APPDATA\rustdesk\id"
+          $pw = Get-Content "$env:APPDATA\rustdesk\passwd"
+          Write-Host "============================="
+          Write-Host "RustDesk ID: $id"
+          Write-Host "RustDesk Password: $pw"
+          Write-Host "============================="
+      - name: Keep session alive for 6 hours
+        run: |
+          Write-Host "Keeping session alive for 6 hours..."
+          Start-Sleep -Seconds 21600 # 6 ore
+      - name: Show RustDesk ID and Password (final)
+        run: |
+          $id = Get-Content "$env:APPDATA\rustdesk\id"
+          $pw = Get-Content "$env:APPDATA\rustdesk\passwd"
+          Write-Host "============================="
+          Write-Host "RustDesk ID: $id"
+          Write-Host "RustDesk Password: $pw"
+          Write-Host "============================="
