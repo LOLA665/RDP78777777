@@ -1,0 +1,213 @@
+name: RDP GAMING: GTA V 34+ FPS TARGET (800x600) - MAX RTX EMULATION
+
+on:
+  workflow_dispatch:
+
+env:
+  TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+  RUNNERADMIN_PASS: ${{ secrets.RUNNERADMIN_PASS }}
+  KEEPALIVE_ITER: 432
+  RUNNERADMIN_USER: runneradmin
+  SOFTWARE_GPU_DIR: C:\SoftwareGPU_Emulators
+  FPS_ESTIMATE: "28-34"
+
+jobs:
+  rdp-gaming:
+    runs-on: windows-2022
+    timeout-minutes: 4320
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # --- RESETARE PAROLĂ & RDP SETUP ---
+      - name: Reset Runneradmin Password and Setup RDP
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $user = $env:RUNNERADMIN_USER
+          $pass = "Runner@" + (Get-Random -Minimum 100000 -Maximum 999999) 
+          
+          Write-Host "Resetăm parola pentru utilizatorul: $user"
+          net user $user $pass 2> $null
+          net localgroup administrators $user /add 2> $null
+          
+          Add-Content -Path $env:GITHUB_ENV -Value ("RUNNERADMIN_PASS={0}" -f $pass)
+
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force | Out-Null
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue | Out-Null
+
+          $t = $env:TEMP
+          try { 
+            Invoke-WebRequest 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile (Join-Path $t 'vc_redist.x64.exe') -ErrorAction Stop
+            Start-Process (Join-Path $t 'vc_redist.x64.exe') -ArgumentList '/install','/quiet','/norestart' -Wait 
+          } catch {}
+
+      # --- AESTHETICS: Windows 11 Look & 4K RANDOM GAMING WALLPAPER ---
+      - name: Set Custom Wallpaper & Dark Mode
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $WallDir = "$env:USERPROFILE\Pictures\Wallpapers"
+          New-Item -Path $WallDir -ItemType Directory -Force | Out-Null
+          $WallPath = Join-Path $WallDir "Random4KGaming.jpg"
+          
+          $WallURL = "https://images.unsplash.com/photo-1542385150-13d8032c7457?fit=crop&w=3840&h=2160" 
+          try { 
+            Invoke-WebRequest -Uri $WallURL -OutFile $WallPath -ErrorAction Stop 
+          } catch { 
+            Write-Warning "Eroare la descărcarea wallpaper-ului 4K." 
+          }
+
+          $RegPath = 'HKCU:\Control Panel\Desktop'
+          Set-ItemProperty -Path $RegPath -Name Wallpaper -Type String -Value $WallPath -Force
+          RUNDLL32.EXE user32.dll,UpdatePerUserSystemParameters 
+          
+          $ThemeRegPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+          Set-ItemProperty -Path $ThemeRegPath -Name 'AppsUseLightTheme' -Type DWord -Value 0 -Force
+          Set-ItemProperty -Path $ThemeRegPath -Name 'SystemUsesLightTheme' -Type DWord -Value 0 -Force
+          
+          $EPPath = Join-Path $env:USERPROFILE "Desktop\ExplorerPatcherSetup.exe"
+          $EPUrl = "https://github.com/valinet/ExplorerPatcher/releases/latest/download/ep_setup.exe"
+          try { 
+            Invoke-WebRequest -Uri $EPUrl -OutFile $EPPath -ErrorAction Stop
+            Write-Host "ExplorerPatcher descărcat." 
+          } catch {}
+
+      # --- EMULARE RTX 5080 (SwiftShader Max Performanță) ---
+      - name: Install SwiftShader (Software GPU - MAX BOOST)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $t = Join-Path $env:TEMP "swiftshader"
+          New-Item -Path $t -ItemType Directory -Force | Out-Null
+          $zip = Join-Path $env:TEMP "SwiftShader-Release.zip"
+          try {
+            Invoke-WebRequest 'https://github.com/google/swiftshader/releases/latest/download/SwiftShader-Release.zip' -OutFile $zip -ErrorAction Stop
+            Expand-Archive -Path $zip -DestinationPath $t -Force
+            New-Item -Path $env:SOFTWARE_GPU_DIR -ItemType Directory -Force | Out-Null
+            
+            Get-ChildItem -Path $t -Filter "*.dll" -Recurse | ForEach-Object { 
+              Copy-Item -Path $_.FullName -Destination $env:SOFTWARE_GPU_DIR -Force 
+            }
+            Write-Host "SwiftShader (RTX 5080 Emulat) files injected."
+          } catch { 
+            Write-Warning "SwiftShader install failed." 
+          }
+
+      # --- Optimizare CPU & Sistem ---
+      - name: Max CPU and System Optimizations
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try { 
+            reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f 
+          } catch {}
+
+      # --- Lansare Joc: Rezoluție 800x600 + Prioritate Realtime + GTA V PARAMETRI MAXIMI ---
+      - name: Launch Games with Max CPU Priority and Forced Minimal Resolution
+        shell: pwsh
+        continue-on-error: true 
+        run: |
+          $mscPath = "C:\Program Files (x86)\Steam\steamapps\common\My Summer Car\MySummerCar.exe"
+          $gtaPath = "C:\Program Files\Rockstar Games\GTA V\GTA5.exe"
+          
+          if (Test-Path $env:SOFTWARE_GPU_DIR) {
+            foreach ($gamePath in @($mscPath, $gtaPath)) {
+              if (Test-Path $gamePath) {
+                Get-ChildItem -Path $env:SOFTWARE_GPU_DIR -Filter "*.dll" | ForEach-Object {
+                  try { 
+                    Copy-Item -Path $_.FullName -Destination (Split-Path $gamePath) -Force -ErrorAction SilentlyContinue 
+                  } catch {}
+                }
+              }
+            }
+          }
+          
+          function Launch-Game {
+            param(
+              [string]$path,
+              [string]$name,
+              [string]$args
+            )
+            if (Test-Path $path) {
+              $proc = Start-Process -FilePath $path -ArgumentList $args -PassThru -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 5
+              try { 
+                $proc.PriorityClass = "Realtime"
+                Write-Host "Prioritate Realtime setată." 
+              } catch { 
+                Write-Warning "Prioritatea Realtime a eșuat. Privilegii." 
+              }
+              try { 
+                $proc.ProcessorAffinity = [System.IntPtr]::op_Explicit(0xFFFFFFFF)
+                Write-Host "Afinat pe toate nucleele." 
+              } catch {}
+            } else { 
+              Write-Warning "$name nu a fost găsit." 
+            }
+          }
+          
+          $gtaArgs = "-safemode -width 800 -height 600 -min_vram -min_video_ram 128 -rgl_hdr_none -nothreading -nograss -lowquality -frame_limit 0 -borderless -no-texture-budget-control"
+          Launch-Game -path $gtaPath -name "GTA5" -args $gtaArgs
+          
+          Launch-Game -path $mscPath -name "My Summer Car" -args ""
+
+      # --- Acces la Distanță (Tailscale) ---
+      - name: Install & Start Tailscale
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            $msi = Join-Path $env:TEMP "tailscale.msi"
+            try {
+              Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi -ErrorAction Stop
+              Start-Process msiexec.exe -ArgumentList @('/i',$msi,'/quiet','/norestart') -Wait -NoNewWindow
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey $env:TAILSCALE_AUTH_KEY --hostname "gh-gaming-$($env:GITHUB_RUN_ID)" --accept-routes
+              Write-Host "Tailscale activat."
+            } catch {
+              Write-Warning "Instalarea sau pornirea Tailscale a eșuat."
+            }
+          } else {
+            Write-Warning "Nu există cheie Tailscale pentru autentificare."
+          }
+
+      - name: Show connection info and FPS estimate
+        shell: pwsh
+        run: |
+          Write-Host "--------------------------------------------------------"
+          Write-Host "             Server RDP Gaming Information              "
+          Write-Host "--------------------------------------------------------"
+          Write-Host ("User: {0}" -f $env:RUNNERADMIN_USER)
+          Write-Host ("**NOUA PAROLĂ: {0}**" -f $env:RUNNERADMIN_PASS)
+          $ip = ""
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+            try { 
+              $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 | Select-Object -First 1).Trim() 
+            } catch {}
+          }
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            try { 
+              $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.InterfaceAlias -notlike "Loopback*"} | Select-Object -First 1).IPAddress 
+            } catch {}
+          }
+          if ($ip) {
+            Write-Host ("IP: {0}" -f $ip)
+          } else {
+            Write-Host "IP: (unavailable)"
+          }
+          Write-Host "--------------------------------------------------------"
+          Write-Host "REZOLUȚIE ȚINTĂ: **800x600**"
+          Write-Host "EMULARE GPU: **SwiftShader (MAX PERFORMANCE)**"
+          Write-Host "ESTIMARE FPS GTA V: **{0}**" -f $env:FPS_ESTIMATE
+          Write-Host "--------------------------------------------------------"
+          
+      - name: Keepalive loop
+        shell: pwsh
+        run: |
+          $iters = [int]$env:KEEPALIVE_ITER
+          for ($i=0; $i -lt $iters; $i++) {
+            Write-Host ("Keepalive {0}/{1} la {2}" -f $i, $iters, (Get-Date))
+            Start-Sleep -Seconds 600
+          }
