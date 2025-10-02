@@ -1,0 +1,54 @@
+name: Windows - RustDesk (Runner Mode)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Start Building...
+    runs-on: windows-latest
+    timeout-minutes: 360  # 6 ore (maxim permis de GitHub Actions)
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install RustDesk
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/rustdesk/rustdesk/releases/latest/download/RustDesk.exe" -OutFile "$env:TEMP\RustDesk.exe"
+          Start-Process -FilePath "$env:TEMP\RustDesk.exe" -ArgumentList "/S" -Wait
+          Write-Host "✅ RustDesk instalat."
+
+      - name: Set RustDesk Password (optional)
+        run: |
+          & "C:\Program Files\RustDesk\rustdesk.exe" --password ${{ secrets.RUSTDESK_PASSWORD }}
+          Write-Host "🔒 Parolă RustDesk setată."
+
+      - name: Install Tailscale
+        run: |
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale_1.50.0_amd64.msi" -OutFile "$env:TEMP\tailscale.msi"
+          Start-Process -FilePath msiexec -ArgumentList "/i $env:TEMP\tailscale.msi /quiet" -Wait
+          Write-Host "✅ Tailscale instalat."
+
+      - name: Authenticate Tailscale
+        run: |
+          & "C:\Program Files (x86)\Tailscale IPN\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }}
+          Write-Host "🌐 Tailscale autentificat."
+
+      - name: Get Tailscale IP
+        run: |
+          $ip = (& "C:\Program Files (x86)\Tailscale IPN\tailscale.exe" ip)[0]
+          echo "Tailscale IP: $ip"
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+      - name: Start Time Counter (6 hours)
+        run: |
+          python time.py
+
+      - name: Output Connection Info
+        run: |
+          echo "✅ VM (runner) este gata!"
+          echo "Conectează-te la acest runner via:"
+          echo "👉 RustDesk ID: $(rustdesk.exe --get-id)"
+          echo "🌐 Tailscale IP: ${{ env.TAILSCALE_IP }}"
+          echo "⏱️ Acest runner va rula 6 ore, apoi se va opri automat."
