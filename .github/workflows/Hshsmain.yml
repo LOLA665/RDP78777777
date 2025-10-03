@@ -1,0 +1,45 @@
+name: Provision Windows 11 VM with RustDesk Access
+
+on:
+  workflow_dispatch:
+
+env:
+  VM_NAME: "windows11-gaming-vm"
+  VM_RAM: 32G
+  VM_SSD_SIZE: 700G
+  VM_CPU_CORES: 8
+  RUSTDESK_SERVER: "your-rustdesk-server-address"
+  RUSTDESK_PASSWORD: "${{ secrets.RUSTDESK_PASSWORD }}"
+
+jobs:
+  provision-vm:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Provision VM on Private VM Tuner Host
+        run: |
+          # Replace with your provisioning API or CLI commands
+          # For example, using curl to your private VM tuner REST API:
+          curl -X POST https://your-vm-tuner-host/api/vms \
+            -H "Authorization: Bearer ${{ secrets.VM_TUNER_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "name": "'$VM_NAME'",
+              "cpu": '$VM_CPU_CORES',
+              "ram": "'$VM_RAM'",
+              "disk": "'$VM_SSD_SIZE'",
+              "os": "windows11"
+            }'
+
+      - name: Wait for VM to become ready
+        run: |
+          # Custom code to wait and check VM status before proceeding
+
+      - name: Install or Start RustDesk Server & Client on VM
+        run: |
+          # Use remote commands or cloud-init to install/start RustDesk on VM
+          # SSH or API calls to your VM tuner host to inject these commands
+
+      - name: Output connection info
+        run: |
+          echo "Connect to VM using RustDesk server $RUSTDESK_SERVER with password $RUSTDESK_PASSWORD"
